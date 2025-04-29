@@ -1,0 +1,19 @@
+# compiled output
+/target/
+**/*.rs.bk
+
+# editor stuff
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+
+# backups or logs
+*.log
+*.bak
+*.swp
+
+# optional: config files
+/config/*.json
+/secrets.nix
