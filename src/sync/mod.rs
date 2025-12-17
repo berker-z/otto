@@ -69,6 +69,12 @@ pub struct SyncEngine {
     db: Arc<Database>,
 }
 
+#[derive(Debug, Default)]
+struct FolderSyncReport {
+    folder: String,
+    expunged_uids: Vec<u32>,
+}
+
 impl SyncEngine {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
@@ -140,14 +146,14 @@ impl SyncEngine {
                     CONNECTION_POOL.return_connection(pool_key, session).await;
 
                     match result {
-                        Ok(_) => {
+                        Ok(report) => {
                             info!(
                                 account = %account.id,
                                 folder = %folder_name,
                                 elapsed_ms = ?folder_start.elapsed().as_millis(),
                                 "Folder sync completed"
                             );
-                            Ok(())
+                            Ok(report)
                         }
                         Err(e) => {
                             warn!(account = %account.id, folder = %folder_name, error = %e, "Folder sync failed");
@@ -164,15 +170,40 @@ impl SyncEngine {
         // Check for errors
         let mut success_count = 0;
         let mut error_count = 0;
+        let mut reports = Vec::new();
         for result in results {
             match result {
-                Ok(Ok(())) => success_count += 1,
+                Ok(Ok(report)) => {
+                    success_count += 1;
+                    reports.push(report);
+                }
                 Ok(Err(_)) => error_count += 1,
                 Err(e) => {
                     warn!(account = %account.id, error = %e, "Folder sync task panicked");
                     error_count += 1;
                 }
             }
+        }
+
+        // Apply expunge purges after all folders have synced, so moves across folders
+        // don't get deleted before their location updates are processed.
+        for report in reports {
+            if report.expunged_uids.is_empty() {
+                continue;
+            }
+
+            let deleted = self
+                .db
+                .delete_messages_by_folder_and_uids(&account.id, &report.folder, &report.expunged_uids)
+                .await?;
+
+            info!(
+                account = %account.id,
+                folder = %report.folder,
+                expunged = report.expunged_uids.len(),
+                deleted = deleted,
+                "Purged expunged UIDs from local cache"
+            );
         }
 
         info!(
@@ -193,7 +224,9 @@ impl SyncEngine {
         account: &Account,
         folder_name: &str,
         force: bool,
-    ) -> Result<()> {
+    ) -> Result<FolderSyncReport> {
+        const EXPUNGE_SCAN_INTERVAL_SECS: i64 = 6 * 60 * 60;
+
         // Prefer SELECT (CONDSTORE) so we get HIGHESTMODSEQ. If the server doesn't support it,
         // fall back to a regular SELECT (UID-based sync will be used).
         let mailbox = match session.select_condstore(folder_name).await {
@@ -231,14 +264,16 @@ impl SyncEngine {
         }
 
         // Load existing folder state from DB
-        let folder_state = self
+        let mut folder_state = self
             .db
             .list_folders(&account.id)
             .await?
             .into_iter()
             .find(|f| f.name == folder_name);
 
-        // Check UIDVALIDITY
+        let now = now_ts();
+
+        // UIDVALIDITY change invalidates all cached UIDs for this folder; force a folder resync.
         if let Some(ref state) = folder_state {
             if let Some(stored_uidvalidity) = state.uidvalidity {
                 if stored_uidvalidity != current_uidvalidity {
@@ -247,10 +282,36 @@ impl SyncEngine {
                         folder = %folder_name,
                         old_uidvalidity = stored_uidvalidity,
                         new_uidvalidity = current_uidvalidity,
-                        "UIDVALIDITY changed, requiring full resync"
+                        "UIDVALIDITY changed; clearing folder cache and forcing full resync"
                     );
-                    // UIDVALIDITY change means all UIDs are invalid - would need full resync
-                    // For now, we'll just update the UIDVALIDITY and continue
+
+                    let deleted = self
+                        .db
+                        .delete_messages_by_folder(&account.id, folder_name)
+                        .await?;
+
+                    warn!(
+                        account = %account.id,
+                        folder = %folder_name,
+                        deleted = deleted,
+                        "Cleared cached messages for folder due to UIDVALIDITY change"
+                    );
+
+                    let updated = self
+                        .db
+                        .upsert_folder_state(
+                            &account.id,
+                            folder_name,
+                            Some(current_uidvalidity),
+                            None,
+                            None,
+                            Some(current_exists),
+                            Some(now),
+                            None,
+                        )
+                        .await?;
+
+                    folder_state = Some(updated);
                 }
             }
         }
@@ -262,7 +323,8 @@ impl SyncEngine {
         if !force {
             if let Some(ref state) = folder_state {
                 if let (Some(stored_modseq), Some(current_modseq)) = (state.highestmodseq, current_highestmodseq) {
-                    if stored_modseq > 0 && current_modseq == stored_modseq {
+                    let stored_exists = state.exists_count.unwrap_or(0);
+                    if stored_modseq > 0 && current_modseq == stored_modseq && stored_exists == current_exists {
                         // No changes at all - skip sync entirely
                         info!(
                             account = %account.id,
@@ -270,17 +332,33 @@ impl SyncEngine {
                             modseq = current_modseq,
                             "No changes detected (MODSEQ match) - skipping sync"
                         );
-                        return Ok(());
+                        self.db
+                            .upsert_folder_state(
+                                &account.id,
+                                folder_name,
+                                Some(current_uidvalidity),
+                                current_highest_uid,
+                                current_highestmodseq,
+                                Some(current_exists),
+                                Some(now),
+                                folder_state.as_ref().and_then(|s| s.last_uid_scan_ts),
+                            )
+                            .await?;
+
+                        return Ok(FolderSyncReport {
+                            folder: folder_name.to_string(),
+                            expunged_uids: Vec::new(),
+                        });
                     }
                 }
             }
         }
 
-        let now = now_ts();
-
         // Incremental path: use MODSEQ search to fetch only changed UIDs.
         let stored_modseq = folder_state.as_ref().and_then(|s| s.highestmodseq).unwrap_or(0);
         let stored_highest_uid = folder_state.as_ref().and_then(|s| s.highest_uid).unwrap_or(0);
+        let stored_exists = folder_state.as_ref().and_then(|s| s.exists_count).unwrap_or(0);
+        let stored_last_uid_scan_ts = folder_state.as_ref().and_then(|s| s.last_uid_scan_ts);
 
         if stored_modseq == 0 || current_highestmodseq.is_none() {
             // We don't have a usable MODSEQ baseline yet (or server didn't report it).
@@ -317,6 +395,11 @@ impl SyncEngine {
                     .await?;
             }
 
+            let expunged_uids: Vec<u32> = local_uids
+                .difference(&remote_uids)
+                .copied()
+                .collect();
+
             let highest_uid = current_highest_uid
                 .or_else(|| remote_uids.iter().max().copied())
                 .unwrap_or(stored_highest_uid);
@@ -330,11 +413,14 @@ impl SyncEngine {
                     current_highestmodseq,
                     Some(current_exists),
                     Some(now),
-                    None,
+                    Some(now),
                 )
                 .await?;
 
-            return Ok(());
+            return Ok(FolderSyncReport {
+                folder: folder_name.to_string(),
+                expunged_uids,
+            });
         }
 
         let modseq_query = format!("SINCE {} MODSEQ {}", cutoff_str, stored_modseq + 1);
@@ -360,6 +446,31 @@ impl SyncEngine {
 
         let changed_uids: Vec<u32> = uid_set.iter().cloned().collect();
         if changed_uids.is_empty() {
+            let mut expunged_uids = Vec::new();
+            let mut last_uid_scan_ts = stored_last_uid_scan_ts;
+            let should_uid_scan = (stored_exists > 0 && current_exists < stored_exists)
+                || stored_last_uid_scan_ts
+                    .map(|ts| now.saturating_sub(ts) > EXPUNGE_SCAN_INTERVAL_SECS)
+                    .unwrap_or(true);
+
+            if should_uid_scan {
+                match self
+                    .scan_expunged_uids(session, &account.id, folder_name, &cutoff_str)
+                    .await
+                {
+                    Ok(uids) => {
+                        expunged_uids = uids;
+                        last_uid_scan_ts = Some(now);
+                    }
+                    Err(e) => warn!(
+                        account = %account.id,
+                        folder = %folder_name,
+                        error = %e,
+                        "Expunge scan failed"
+                    ),
+                }
+            }
+
             let highest_uid = current_highest_uid.unwrap_or(stored_highest_uid);
             self.db
                 .upsert_folder_state(
@@ -370,10 +481,13 @@ impl SyncEngine {
                     current_highestmodseq,
                     Some(current_exists),
                     Some(now),
-                    folder_state.as_ref().and_then(|s| s.last_uid_scan_ts),
+                    last_uid_scan_ts,
                 )
                 .await?;
-            return Ok(());
+            return Ok(FolderSyncReport {
+                folder: folder_name.to_string(),
+                expunged_uids,
+            });
         }
 
         let existing_by_uid = self
@@ -410,6 +524,31 @@ impl SyncEngine {
                 .await?;
         }
 
+        let mut expunged_uids = Vec::new();
+        let mut last_uid_scan_ts = stored_last_uid_scan_ts;
+        let should_uid_scan = (stored_exists > 0 && current_exists < stored_exists)
+            || stored_last_uid_scan_ts
+                .map(|ts| now.saturating_sub(ts) > EXPUNGE_SCAN_INTERVAL_SECS)
+                .unwrap_or(true);
+
+        if should_uid_scan {
+            match self
+                .scan_expunged_uids(session, &account.id, folder_name, &cutoff_str)
+                .await
+            {
+                Ok(uids) => {
+                    expunged_uids = uids;
+                    last_uid_scan_ts = Some(now);
+                }
+                Err(e) => warn!(
+                    account = %account.id,
+                    folder = %folder_name,
+                    error = %e,
+                    "Expunge scan failed"
+                ),
+            }
+        }
+
         let highest_uid = current_highest_uid
             .or_else(|| changed_uids.iter().max().copied())
             .unwrap_or(stored_highest_uid);
@@ -422,11 +561,40 @@ impl SyncEngine {
                 current_highestmodseq,
                 Some(current_exists),
                 Some(now),
-                folder_state.as_ref().and_then(|s| s.last_uid_scan_ts),
+                last_uid_scan_ts,
             )
             .await?;
 
-        Ok(())
+        Ok(FolderSyncReport {
+            folder: folder_name.to_string(),
+            expunged_uids,
+        })
+    }
+
+    async fn scan_expunged_uids(
+        &self,
+        session: &mut ImapSession,
+        account_id: &str,
+        folder_name: &str,
+        cutoff_str: &str,
+    ) -> Result<Vec<u32>> {
+        let local_uid_map = self
+            .db
+            .load_uid_to_message_id_map_by_folder(account_id, folder_name)
+            .await?;
+        if local_uid_map.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let all_uids_query = format!("SINCE {}", cutoff_str);
+        let uid_set = session
+            .uid_search(&all_uids_query)
+            .await
+            .with_context(|| format!("UID SEARCH expunge-scan: {}", all_uids_query))?;
+        let remote_uids: HashSet<u32> = uid_set.iter().cloned().collect();
+        let local_uids: HashSet<u32> = local_uid_map.keys().copied().collect();
+
+        Ok(local_uids.difference(&remote_uids).copied().collect())
     }
 
     async fn fetch_and_store_new_messages(
@@ -842,13 +1010,13 @@ impl SyncEngine {
     ) -> Result<()> {
         const BATCH_SIZE: usize = 250;
 
-        let mut updates: Vec<(u32, Vec<String>)> = Vec::new();
+        let mut updates: Vec<(u32, Vec<String>, Vec<String>)> = Vec::new();
         for chunk in uids.chunks(BATCH_SIZE) {
             let uid_seq = Self::build_uid_sequence(chunk);
             let mut stream = session
-                .uid_fetch(&uid_seq, "(UID FLAGS)")
+                .uid_fetch(&uid_seq, "(UID FLAGS X-GM-LABELS)")
                 .await
-                .context("fetching flags for changed messages")?;
+                .context("fetching flags/labels for changed messages")?;
 
             while let Some(fetch_result) = stream.next().await {
                 let fetch = match fetch_result {
@@ -865,7 +1033,8 @@ impl SyncEngine {
                 }
 
                 let flags: Vec<String> = fetch.flags().map(|f| format!("{:?}", f)).collect();
-                updates.push((uid, flags));
+                let labels = Self::extract_gm_labels(&fetch);
+                updates.push((uid, flags, labels));
             }
         }
 
@@ -877,7 +1046,7 @@ impl SyncEngine {
                 account = %account.id,
                 folder = %folder_name,
                 count = updates.len(),
-                "Updated flags for changed messages"
+                "Updated flags/labels for changed messages"
             );
         }
 

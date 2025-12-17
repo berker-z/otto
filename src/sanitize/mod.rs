@@ -1,7 +1,11 @@
 use crate::types::BodyRecord;
 use anyhow::Result;
 use html2text::from_read;
+use mailparse::body::Body;
+use mailparse::DispositionType;
+use mailparse::MailHeaderMap;
 use mailparse::ParsedMail;
+use serde::Serialize;
 
 #[derive(Debug)]
 pub struct SanitizedBody {
@@ -12,15 +16,25 @@ pub struct SanitizedBody {
     pub has_attachments: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct AttachmentMeta {
+    filename: Option<String>,
+    mime_type: String,
+    disposition: String,
+    content_id: Option<String>,
+    encoded_bytes: usize,
+}
+
 pub fn sanitize(parsed: &ParsedMail, raw_bytes: &[u8]) -> Result<SanitizedBody> {
     let text = extract_text(parsed, raw_bytes);
     let raw_hash = compute_hash(raw_bytes);
-    let has_attachments = detect_attachments(parsed);
+    let (mime_summary, attachments) = summarize_mime(parsed);
+    let has_attachments = !attachments.is_empty();
 
     Ok(SanitizedBody {
         sanitized_text: text,
-        mime_summary: None,
-        attachments_json: None,
+        mime_summary: Some(mime_summary),
+        attachments_json: serde_json::to_string(&attachments).ok(),
         raw_hash,
         has_attachments,
     })
@@ -46,14 +60,129 @@ fn compute_hash(data: &[u8]) -> String {
     format!("{:x}", hasher.finish())
 }
 
-fn detect_attachments(parsed: &ParsedMail) -> bool {
-    // Check if any part has Content-Disposition: attachment
-    for part in &parsed.subparts {
-        if part.get_content_disposition().disposition == mailparse::DispositionType::Attachment {
-            return true;
-        }
+fn summarize_mime(parsed: &ParsedMail) -> (String, Vec<AttachmentMeta>) {
+    let mut lines = Vec::new();
+    let mut attachments = Vec::new();
+    walk_mime(parsed, 0, &mut lines, &mut attachments);
+
+    let summary = if lines.is_empty() {
+        "(empty MIME)".to_string()
+    } else {
+        lines.join("\n")
+    };
+
+    (summary, attachments)
+}
+
+fn walk_mime(part: &ParsedMail, depth: usize, lines: &mut Vec<String>, attachments: &mut Vec<AttachmentMeta>) {
+    // Hard cap to avoid pathological MIME blowing up output.
+    if lines.len() > 300 || depth > 20 {
+        return;
     }
-    false
+
+    let ctype = &part.ctype;
+    let disp = part.get_content_disposition();
+    let filename = extract_filename(part);
+    let content_id = part
+        .headers
+        .get_first_value("Content-ID")
+        .map(|v| v.trim().trim_matches(&['<', '>'][..]).to_string());
+
+    let (disposition, encoded_bytes) = match part.get_body_encoded() {
+        Body::Base64(b) => (disp_to_string(&disp.disposition), b.get_raw().len()),
+        Body::QuotedPrintable(b) => (disp_to_string(&disp.disposition), b.get_raw().len()),
+        Body::SevenBit(b) => (disp_to_string(&disp.disposition), b.get_raw().len()),
+        Body::EightBit(b) => (disp_to_string(&disp.disposition), b.get_raw().len()),
+        Body::Binary(b) => (disp_to_string(&disp.disposition), b.get_raw().len()),
+    };
+
+    let indent = "  ".repeat(depth);
+    let mut line = format!("{indent}{}", ctype.mimetype);
+    if ctype.mimetype.starts_with("text/") && !ctype.charset.is_empty() {
+        line.push_str(&format!("; charset={}", ctype.charset));
+    }
+    if !disposition.is_empty() {
+        line.push_str(&format!("; disp={}", disposition));
+    }
+    if let Some(ref name) = filename {
+        line.push_str(&format!("; filename={}", name));
+    }
+    if let Some(ref cid) = content_id {
+        line.push_str(&format!("; cid={}", cid));
+    }
+    if encoded_bytes > 0 {
+        line.push_str(&format!("; bytes={}", encoded_bytes));
+    }
+    lines.push(line);
+
+    let is_container = ctype.mimetype.starts_with("multipart/") && !part.subparts.is_empty();
+    if !is_container && is_attachment_part(&ctype.mimetype, &disp.disposition, filename.as_deref(), content_id.as_deref()) {
+        attachments.push(AttachmentMeta {
+            filename,
+            mime_type: ctype.mimetype.clone(),
+            disposition,
+            content_id,
+            encoded_bytes,
+        });
+    }
+
+    for child in &part.subparts {
+        walk_mime(child, depth + 1, lines, attachments);
+    }
+}
+
+fn extract_filename(part: &ParsedMail) -> Option<String> {
+    let disp = part.get_content_disposition();
+    let disp_name = disp
+        .params
+        .get("filename")
+        .or_else(|| disp.params.get("name"))
+        .cloned();
+
+    let ctype_name = part
+        .ctype
+        .params
+        .get("name")
+        .or_else(|| part.ctype.params.get("filename"))
+        .cloned();
+
+    disp_name
+        .or(ctype_name)
+        .and_then(|v| {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+}
+
+fn disp_to_string(disp: &DispositionType) -> String {
+    match disp {
+        DispositionType::Inline => "inline".to_string(),
+        DispositionType::Attachment => "attachment".to_string(),
+        DispositionType::FormData => "form-data".to_string(),
+        DispositionType::Extension(v) => v.clone(),
+    }
+}
+
+fn is_attachment_part(
+    mimetype: &str,
+    disposition: &DispositionType,
+    filename: Option<&str>,
+    content_id: Option<&str>,
+) -> bool {
+    if matches!(disposition, DispositionType::Attachment) {
+        return true;
+    }
+    if filename.is_some() {
+        return true;
+    }
+    if content_id.is_some() && !mimetype.starts_with("text/") {
+        return true;
+    }
+    !mimetype.starts_with("text/") && !mimetype.starts_with("multipart/")
 }
 
 fn extract_text(parsed: &ParsedMail, raw_bytes: &[u8]) -> String {

@@ -1,8 +1,8 @@
 # Otto
 
-Otto is a Rust IMAP syncer for Gmail. It authorizes with OAuth2, opens one IMAP connection per folder, and keeps a local SQLite cache of messages and sanitized bodies. Each run skips work when MODSEQ matches; otherwise it fetches only new UIDs and updates flags, parsing messages in parallel and writing in batches.
+Otto is a Rust IMAP syncer for Gmail. It authorizes with OAuth2, opens one IMAP connection per folder, and keeps a local SQLite cache of messages and sanitized bodies. Each run skips work when MODSEQ/EXISTS match; otherwise it fetches only new UIDs and updates flags/labels, parsing messages in parallel and writing in batches.
 
-On startup the CLI loads accounts from SQLite (or onboards one), runs the sync unless `--no-sync`, and prints a small inbox preview from the cache. Messages are keyed by stable Gmail ids (`X-GM-MSGID`) so moves avoid duplicates; expunges still need QRESYNC/VANISHED to be tracked.
+On startup the CLI loads accounts from SQLite (or onboards one), runs the sync unless `--no-sync`, and prints a small inbox preview from the cache. Messages are keyed by stable Gmail ids (`X-GM-MSGID`) so moves avoid duplicates; expunges are handled via a periodic UID scan fallback (QRESYNC/VANISHED is not implemented).
 
 ## Features
 

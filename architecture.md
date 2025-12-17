@@ -5,6 +5,7 @@ Otto syncs Gmail over IMAP into a local SQLite cache. Each run authorizes with O
 On startup the CLI loads config and accounts from SQLite, optionally onboards a new account, runs the sync engine unless `--no-sync`, and prints a small inbox preview from the cache.
 
 ## Components
+
 - `src/cli.rs`: CLI flags (`--add-account`, `--no-sync`, `--force`).
 - `src/app.rs`: Wiring; loads config/DB, onboarding, runs sync, prints preview.
 - `src/oauth.rs` + `onboarding.rs`: OAuth2 PKCE flow and account creation.
@@ -15,22 +16,26 @@ On startup the CLI loads config and accounts from SQLite, optionally onboards a 
 - `src/types.rs`: Shared structs (Account, MessageRecord, FolderState, etc.).
 
 ## Sync Flow (per folder)
+
 1. `SELECT (CONDSTORE)` → read `UIDVALIDITY`, `HIGHESTMODSEQ`, `UIDNEXT`.
-2. If stored MODSEQ equals current and `--force` is not set → skip.
+2. If stored MODSEQ and `EXISTS` match current and `--force` is not set → skip.
 3. If no MODSEQ baseline → `UID SEARCH SINCE <cutoff>` then fetch and store new UIDs.
 4. Otherwise `UID SEARCH SINCE <cutoff> MODSEQ <stored+1>`:
    - Fetch bodies for unseen UIDs.
-   - Fetch flags for existing UIDs and update DB.
-5. Update folder state (`highest_uid`, `highestmodseq`, counts, timestamps).
-6. Local dedupe pass removes pre-X-GM-MSGID duplicates by `raw_hash`.
+   - Fetch flags + labels for existing UIDs and update DB.
+5. If `EXISTS` decreased (or scan is stale), run a periodic `UID SEARCH SINCE <cutoff>` to detect missing UIDs.
+6. Update folder state (`highest_uid`, `highestmodseq`, counts, timestamps).
+7. After all folders finish, purge missing UIDs from the DB (prevents “move” races).
+8. Local dedupe pass removes pre-X-GM-MSGID duplicates by `raw_hash`.
 
 ## Data Model (SQLite)
+
 - `accounts`: id, email, provider, cutoff date, poll interval, folder list.
 - `folders`: per-folder state (`uidvalidity`, `highest_uid`, `highestmodseq`, counts, timestamps).
 - `messages`: metadata keyed by stable message id (`X-GM-MSGID`), per-folder uid, flags/labels, hashes.
 - `bodies`: raw RFC822, sanitized text, MIME summary, attachments JSON.
 
 ## Current Limitations
-- Expunges require QRESYNC/VANISHED; deletions can linger until a full resync.
-- UIDVALIDITY changes are only logged; a full folder resync/reset is not automated yet.
-- Attachment metadata, MIME summaries, and Gmail label metadata are placeholders.***
+
+- QRESYNC/VANISHED is not implemented; expunges are handled via a periodic UID scan fallback.
+- Folder membership is modeled as a single “current folder” per message; true multi-label membership isn’t represented yet.\*\*\*

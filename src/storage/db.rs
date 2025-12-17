@@ -433,7 +433,7 @@ impl Database {
         &self,
         account_id: &str,
         folder: &str,
-        updates: &[(u32, Vec<String>)],
+        updates: &[(u32, Vec<String>, Vec<String>)],
     ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
@@ -442,22 +442,23 @@ impl Database {
         let now = now_ts();
         let mut tx = self.pool.begin().await.context("beginning transaction")?;
 
-        for (uid, flags) in updates {
+        for (uid, flags, labels) in updates {
             sqlx::query(
                 r#"
                 UPDATE messages
-                SET flags = ?1, updated_at = ?2
-                WHERE account_id = ?3 AND folder = ?4 AND uid = ?5;
+                SET flags = ?1, labels = ?2, updated_at = ?3
+                WHERE account_id = ?4 AND folder = ?5 AND uid = ?6;
                 "#,
             )
             .bind(serde_json::to_string(flags).unwrap_or_else(|_| "[]".into()))
+            .bind(serde_json::to_string(labels).unwrap_or_else(|_| "[]".into()))
             .bind(now)
             .bind(account_id)
             .bind(folder)
             .bind(*uid as i64)
             .execute(&mut *tx)
             .await
-            .context("updating message flags")?;
+            .context("updating message flags/labels")?;
         }
 
         tx.commit().await.context("committing flag update tx")?;
@@ -955,6 +956,91 @@ impl Database {
             .context("deleting message")?;
 
         Ok(())
+    }
+
+    pub async fn delete_messages_by_folder(&self, account_id: &str, folder: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await.context("beginning delete tx")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM bodies
+            WHERE message_id IN (
+                SELECT id FROM messages WHERE account_id = ?1 AND folder = ?2
+            );
+            "#,
+        )
+        .bind(account_id)
+        .bind(folder)
+        .execute(&mut *tx)
+        .await
+        .context("deleting bodies by folder")?;
+
+        let res = sqlx::query("DELETE FROM messages WHERE account_id = ?1 AND folder = ?2;")
+            .bind(account_id)
+            .bind(folder)
+            .execute(&mut *tx)
+            .await
+            .context("deleting messages by folder")?;
+
+        tx.commit().await.context("committing delete tx")?;
+        Ok(res.rows_affected())
+    }
+
+    pub async fn delete_messages_by_folder_and_uids(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uids: &[u32],
+    ) -> Result<u64> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.pool.begin().await.context("beginning delete tx")?;
+
+        // Delete bodies first to be robust even if foreign key cascading is misconfigured.
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "DELETE FROM bodies WHERE message_id IN (SELECT id FROM messages WHERE account_id = ",
+        );
+        qb.push_bind(account_id);
+        qb.push(" AND folder = ");
+        qb.push_bind(folder);
+        qb.push(" AND uid IN (");
+        {
+            let mut separated = qb.separated(", ");
+            for uid in uids {
+                separated.push_bind(*uid as i64);
+            }
+        }
+        qb.push("))");
+
+        qb.build()
+            .execute(&mut *tx)
+            .await
+            .context("deleting bodies by uid list")?;
+
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("DELETE FROM messages WHERE account_id = ");
+        qb.push_bind(account_id);
+        qb.push(" AND folder = ");
+        qb.push_bind(folder);
+        qb.push(" AND uid IN (");
+        {
+            let mut separated = qb.separated(", ");
+            for uid in uids {
+                separated.push_bind(*uid as i64);
+            }
+        }
+        qb.push(")");
+
+        let res = qb
+            .build()
+            .execute(&mut *tx)
+            .await
+            .context("deleting messages by uid list")?;
+
+        tx.commit().await.context("committing delete tx")?;
+        Ok(res.rows_affected())
     }
 }
 
