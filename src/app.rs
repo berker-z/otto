@@ -62,7 +62,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Decode MIME-encoded subjects for display
             let subject = decode_mime_words(subject);
 
-            println!("{}. [{}] {}", i + 1, date, subject);
+            let is_read = msg
+                .flags
+                .iter()
+                .any(|f| f.eq("Seen") || f.eq("\\Seen"));
+            let status = if is_read { "R" } else { "U" };
+
+            println!("{}. [{}] [{}] {}", i + 1, date, status, subject);
             println!("   From: {}", from);
             println!("   Folder: {}", msg.folder);
 

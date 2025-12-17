@@ -16,6 +16,7 @@
 - IMAP IDLE for push-style updates.
 - TLS session resumption/connection pooling tuning for faster startups.
 - Optional compression for stored RFC822 blobs.\*\*\*
+- Bidirectional read/unread sync (when toggled in Otto, update IMAP flags).
 
 ## Done (Recent)
 
