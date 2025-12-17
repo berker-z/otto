@@ -5,6 +5,7 @@
 - Add QRESYNC/VANISHED support to avoid periodic UID scans (fallback exists).
 - Decide and document folder semantics (single “current folder” vs multi-label membership).
 - Add lightweight sync stats (counts + timings) to validate correctness/regressions.
+- Optional: expose a “copy/open raw link” fallback alongside cleaned URLs if stripping ever breaks a link.
 
 ## Next
 

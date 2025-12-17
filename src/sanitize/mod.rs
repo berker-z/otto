@@ -5,7 +5,11 @@ use mailparse::DispositionType;
 use mailparse::MailHeaderMap;
 use mailparse::ParsedMail;
 use mailparse::body::Body;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Serialize;
+use url::Url;
+use url::form_urlencoded;
 
 #[derive(Debug)]
 pub struct SanitizedBody {
@@ -198,19 +202,21 @@ fn is_attachment_part(
 fn extract_text(parsed: &ParsedMail, raw_bytes: &[u8]) -> String {
     if parsed.subparts.is_empty() {
         if parsed.ctype.mimetype.eq_ignore_ascii_case("text/plain") {
-            return String::from_utf8_lossy(parsed.get_body_raw().unwrap_or_default().as_ref())
+            let body = String::from_utf8_lossy(parsed.get_body_raw().unwrap_or_default().as_ref())
                 .to_string();
+            return render_text_part(&body);
         }
         if parsed.ctype.mimetype.eq_ignore_ascii_case("text/html") {
             let html = parsed.get_body_raw().unwrap_or_default();
-            return html_to_text(&html);
+            return render_html_part(&html);
         }
     }
 
     for part in &parsed.subparts {
         if part.ctype.mimetype.eq_ignore_ascii_case("text/plain") {
-            return String::from_utf8_lossy(part.get_body_raw().unwrap_or_default().as_ref())
+            let body = String::from_utf8_lossy(part.get_body_raw().unwrap_or_default().as_ref())
                 .to_string();
+            return render_text_part(&body);
         }
     }
 
@@ -218,18 +224,184 @@ fn extract_text(parsed: &ParsedMail, raw_bytes: &[u8]) -> String {
     if let Some(first) = parsed.subparts.first() {
         if first.ctype.mimetype.eq_ignore_ascii_case("text/html") {
             let html = first.get_body_raw().unwrap_or_default();
-            return html_to_text(&html);
+            return render_html_part(&html);
         }
         let raw = first.get_body_raw().unwrap_or_default();
-        return String::from_utf8_lossy(raw.as_ref()).to_string();
+        return render_text_part(&String::from_utf8_lossy(raw.as_ref()).to_string());
     }
 
     // As last resort, render the whole raw message body.
-    String::from_utf8_lossy(raw_bytes).to_string()
+    render_text_part(&String::from_utf8_lossy(raw_bytes).to_string())
 }
 
 fn html_to_text(html: &[u8]) -> String {
     from_read(html, 80).unwrap_or_default()
+}
+
+fn render_text_part(body: &str) -> String {
+    let cleaned = clean_urls_in_text(body);
+    if looks_like_html(&cleaned) {
+        html_to_text(cleaned.as_bytes())
+    } else {
+        cleaned
+    }
+}
+
+fn render_html_part(html: &[u8]) -> String {
+    let cleaned = clean_urls_in_text(&String::from_utf8_lossy(html));
+    html_to_text(cleaned.as_bytes())
+}
+
+fn looks_like_html(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("<html")
+        || lower.contains("<body")
+        || lower.contains("<div")
+        || lower.contains("<span")
+        || lower.contains("<p")
+        || lower.contains("<table")
+        || lower.contains("<br")
+        || lower.contains("</")
+    {
+        return true;
+    }
+
+    let angle_count = body.as_bytes().iter().filter(|b| **b == b'<').count();
+    angle_count > 5
+}
+
+fn clean_urls_in_text(body: &str) -> String {
+    // Clean URL query params (tracker-heavy ones) without stripping functional params.
+    static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s<>()"']+"#).unwrap());
+
+    URL_RE
+        .replace_all(body, |caps: &regex::Captures| {
+            let url = &caps[0];
+            clean_url(url)
+        })
+        .into_owned()
+}
+
+fn clean_url(raw: &str) -> String {
+    // Exact matches to strip quickly.
+    const DROP_EXACT: &[&str] = &[
+        "gclid",
+        "dclid",
+        "fbclid",
+        "msclkid",
+        "yclid",
+        "mc_eid",
+        "mc_cid",
+        "mkt_tok",
+        "lipi",
+        "loid",
+        "lang",
+        "trackingId",
+        "trackId",
+        "tracking",
+        "token",
+        "otpToken",
+    ];
+    // Prefix-based tracking params (e.g., utm_source, utm_campaign, li_*).
+    const DROP_PREFIXES: &[&str] = &[
+        "utm_",
+        "fbclid",
+        "gclid",
+        "dclid",
+        "msclkid",
+        "yclid",
+        "mc_",
+        "mkt_",
+        "trk",
+        "trkEmail",
+        "mid",
+        "li_",
+        "eid",
+        "cid",
+        "ref",
+        "spm",
+        "sr_",
+        "sc_",
+        "oly_",
+        "campaignId",
+        "emailKey",
+        "uuid",
+        "tracking",
+        "token",
+    ];
+
+    if let Some(unwrapped) = try_unwrap_redirect(raw) {
+        return unwrapped;
+    }
+
+    let Ok(mut parsed) = Url::parse(raw) else {
+        return raw.to_string();
+    };
+
+    let mut kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(k, _)| {
+            let key = k.as_ref();
+            if DROP_EXACT.contains(&key) {
+                return false;
+            }
+            !DROP_PREFIXES.iter().any(|p| key.starts_with(p))
+        })
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    if kept.is_empty() {
+        parsed.set_query(None);
+        return parsed.to_string();
+    }
+
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    for (k, v) in kept.drain(..) {
+        serializer.append_pair(&k, &v);
+    }
+    let new_query = serializer.finish();
+    parsed.set_query(Some(&new_query));
+    parsed.to_string()
+}
+
+fn try_unwrap_redirect(raw: &str) -> Option<String> {
+    let parsed = Url::parse(raw).ok()?;
+    let host = parsed.host_str().unwrap_or_default();
+    let path = parsed.path();
+    let query_pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let pick_param = |keys: &[&str]| -> Option<String> {
+        for k in keys {
+            if let Some((_, v)) = query_pairs.iter().find(|(key, _)| key == k) {
+                return Url::parse(v).ok().map(|u| clean_url(&u.to_string()));
+            }
+        }
+        None
+    };
+
+    // Outlook/OWA redirect pattern.
+    if host.contains("outlook.live.com") && path.contains("redir") {
+        if let Some(dest) = pick_param(&["url", "destination"]) {
+            return Some(dest);
+        }
+    }
+
+    // LinkedIn shorteners/safety redirects.
+    if host.ends_with("lnkd.in") || (host.contains("linkedin.com") && path.contains("redir")) {
+        if let Some(dest) = pick_param(&["url", "dest", "target"]) {
+            return Some(dest);
+        }
+    }
+
+    // Generic redirect params.
+    if let Some(dest) = pick_param(&["url", "u", "target", "dest", "redirect", "redirect_uri"]) {
+        return Some(dest);
+    }
+
+    None
 }
 
 pub fn build_body_record(

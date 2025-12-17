@@ -11,7 +11,7 @@ On startup the CLI loads config and accounts from SQLite, optionally onboards a 
 - `src/oauth.rs` + `onboarding.rs`: OAuth2 PKCE flow and account creation.
 - `src/imap/mod.rs`: IMAP client setup with XOAUTH2 over Rustls.
 - `src/sync/mod.rs`: Sync engine with connection pool, MODSEQ-based incremental sync, fetch/update helpers.
-- `src/sanitize/mod.rs`: MIME parsing, HTML→text, attachment detection, hashing.
+- `src/sanitize/mod.rs`: MIME parsing, HTML→text, attachment detection, hashing; strips tracking params from URLs and unwraps common redirectors before rendering text.
 - `src/storage/db.rs` + `ops.rs`: SQLite schema/migrations and CRUD helpers.
 - `src/types.rs`: Shared structs (Account, MessageRecord, FolderState, etc.).
 - `src/tui.rs`: TUI overlay (top tabs + mail list/detail + agent panel placeholder) driven from the SQLite cache with a spinner indicator while background sync runs.
