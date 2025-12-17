@@ -200,36 +200,9 @@ fn is_attachment_part(
 }
 
 fn extract_text(parsed: &ParsedMail, raw_bytes: &[u8]) -> String {
-    if parsed.subparts.is_empty() {
-        if parsed.ctype.mimetype.eq_ignore_ascii_case("text/plain") {
-            let body = String::from_utf8_lossy(parsed.get_body_raw().unwrap_or_default().as_ref())
-                .to_string();
-            return render_text_part(&body);
-        }
-        if parsed.ctype.mimetype.eq_ignore_ascii_case("text/html") {
-            let html = parsed.get_body_raw().unwrap_or_default();
-            return render_html_part(&html);
-        }
+    if let Some(text) = extract_preferred_text(parsed) {
+        return text;
     }
-
-    for part in &parsed.subparts {
-        if part.ctype.mimetype.eq_ignore_ascii_case("text/plain") {
-            let body = String::from_utf8_lossy(part.get_body_raw().unwrap_or_default().as_ref())
-                .to_string();
-            return render_text_part(&body);
-        }
-    }
-
-    // Fallback: pick first part and convert to text if html, else bytes->lossy string.
-    if let Some(first) = parsed.subparts.first() {
-        if first.ctype.mimetype.eq_ignore_ascii_case("text/html") {
-            let html = first.get_body_raw().unwrap_or_default();
-            return render_html_part(&html);
-        }
-        let raw = first.get_body_raw().unwrap_or_default();
-        return render_text_part(&String::from_utf8_lossy(raw.as_ref()).to_string());
-    }
-
     // As last resort, render the whole raw message body.
     render_text_part(&String::from_utf8_lossy(raw_bytes).to_string())
 }
@@ -270,6 +243,53 @@ fn looks_like_html(body: &str) -> bool {
     angle_count > 5
 }
 
+fn extract_preferred_text(part: &ParsedMail) -> Option<String> {
+    let mimetype = part.ctype.mimetype.to_ascii_lowercase();
+    if part.subparts.is_empty() {
+        if mimetype == "text/plain" {
+            let body = String::from_utf8_lossy(part.get_body_raw().unwrap_or_default().as_ref())
+                .to_string();
+            return Some(render_text_part(&body));
+        }
+        if mimetype == "text/html" {
+            let html = part.get_body_raw().unwrap_or_default();
+            return Some(render_html_part(&html));
+        }
+        return None;
+    }
+
+    // Handle multipart/alternative with preference: text/plain then text/html then others.
+    if mimetype.starts_with("multipart/alternative") {
+        if let Some(text_part) = part
+            .subparts
+            .iter()
+            .find(|p| p.ctype.mimetype.eq_ignore_ascii_case("text/plain"))
+        {
+            if let Some(text) = extract_preferred_text(text_part) {
+                return Some(text);
+            }
+        }
+        if let Some(html_part) = part
+            .subparts
+            .iter()
+            .find(|p| p.ctype.mimetype.eq_ignore_ascii_case("text/html"))
+        {
+            if let Some(text) = extract_preferred_text(html_part) {
+                return Some(text);
+            }
+        }
+    }
+
+    // For other multiparts, walk children and return the first successful extraction.
+    for child in &part.subparts {
+        if let Some(text) = extract_preferred_text(child) {
+            return Some(text);
+        }
+    }
+
+    None
+}
+
 fn clean_urls_in_text(body: &str) -> String {
     // Clean URL query params (tracker-heavy ones) without stripping functional params.
     static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s<>()"']+"#).unwrap());
@@ -301,6 +321,7 @@ fn clean_url(raw: &str) -> String {
         "tracking",
         "token",
         "otpToken",
+        "sparams",
     ];
     // Prefix-based tracking params (e.g., utm_source, utm_campaign, li_*).
     const DROP_PREFIXES: &[&str] = &[
