@@ -1,6 +1,6 @@
 use crate::config::AppDefaults;
-use crate::oauth::{authorize_with_scopes, fetch_user_email, TokenBundle};
-use crate::types::{now_ts, Account, AccountSettings, Provider};
+use crate::oauth::{TokenBundle, authorize_with_scopes, fetch_user_email};
+use crate::types::{Account, AccountSettings, Provider, now_ts};
 use anyhow::Result;
 use oauth2::Scope;
 use tracing::info;

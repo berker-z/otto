@@ -1,10 +1,10 @@
 use crate::types::BodyRecord;
 use anyhow::Result;
 use html2text::from_read;
-use mailparse::body::Body;
 use mailparse::DispositionType;
 use mailparse::MailHeaderMap;
 use mailparse::ParsedMail;
+use mailparse::body::Body;
 use serde::Serialize;
 
 #[derive(Debug)]

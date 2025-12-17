@@ -6,12 +6,12 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
-use ratatui::Terminal;
 
 use crate::types::{BodyRecord, MessageRecord};
 
@@ -157,12 +157,11 @@ fn run_app<B: ratatui::backend::Backend>(
             .checked_sub(app.last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
-        if crossterm::event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(&mut app, key)? {
-                    break;
-                }
-            }
+        if crossterm::event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+            && handle_key(&mut app, key)?
+        {
+            break;
         }
 
         if app.last_tick.elapsed() >= tick_rate {
@@ -201,7 +200,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
-    let size = f.size();
+    let size = f.area();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

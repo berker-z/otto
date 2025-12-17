@@ -27,14 +27,18 @@ fn sanitize_produces_mime_summary_and_attachments_json() {
     let sanitized = sanitize_message(&parsed, &raw);
 
     assert!(sanitized.has_attachments);
-    assert!(sanitized
-        .mime_summary
-        .as_deref()
-        .unwrap_or_default()
-        .contains("application/pdf"));
-    assert!(sanitized
-        .attachments_json
-        .as_deref()
-        .unwrap_or_default()
-        .contains("file.pdf"));
+    assert!(
+        sanitized
+            .mime_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("application/pdf")
+    );
+    assert!(
+        sanitized
+            .attachments_json
+            .as_deref()
+            .unwrap_or_default()
+            .contains("file.pdf")
+    );
 }

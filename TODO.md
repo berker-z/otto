@@ -25,3 +25,14 @@
 - Expunge fallback now runs a periodic UID scan and purges missing UIDs after folder syncs complete.
 - MIME summaries and attachment metadata are now populated; label refresh is included in flag updates.
 - TUI now launches immediately from cached messages, shows a top-bar spinner during background sync, and refreshes from the DB when sync completes.
+
+## Dependency Refresh (Backlog)
+
+- Upgrade stacks in small batches with tests:
+  - Rustls stack: tokio-rustls/rustls-native-certs bump.
+  - sqlx 0.8 upgrade (macros/migrations).
+  - keyring 3.x upgrade and re-test token storage.
+  - mailparse 0.16 + base64 0.22 (MIME/sanitize check).
+  - dirs 6 + toml 0.9 (config load check).
+  - patch bumps like reqwest 0.12.26 can be taken quickly.
+- Command to snapshot current gaps: `nix shell nixpkgs#cargo-outdated -c cargo outdated -R --manifest-path ./Cargo.toml` (same as `--depth 1`).

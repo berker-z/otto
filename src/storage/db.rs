@@ -1,5 +1,5 @@
 use crate::types::{
-    now_ts, Account, AccountSettings, BodyRecord, FolderState, MessageRecord, Provider,
+    Account, AccountSettings, BodyRecord, FolderState, MessageRecord, Provider, now_ts,
 };
 use anyhow::{Context, Result};
 use chrono::NaiveDate;

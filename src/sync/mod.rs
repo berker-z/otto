@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use futures::{future::join_all, StreamExt};
+use futures::{StreamExt, future::join_all};
 use oauth2::Scope;
 use once_cell::sync::Lazy;
 use tokio::net::TcpStream;
@@ -15,8 +15,8 @@ use tracing::{debug, info, warn};
 use crate::imap::ImapClient;
 use crate::oauth::authorize_with_scopes;
 use crate::sanitize::sanitize_message;
-use crate::storage::{db::FolderStateUpdate, db::MessageLocationUpdate, Database};
-use crate::types::{now_ts, Account, BodyRecord, MessageRecord};
+use crate::storage::{Database, db::FolderStateUpdate, db::MessageLocationUpdate};
+use crate::types::{Account, BodyRecord, MessageRecord, now_ts};
 
 type ImapSession = async_imap::Session<Compat<tokio_rustls::client::TlsStream<TcpStream>>>;
 
@@ -277,94 +277,91 @@ impl SyncEngine {
         let now = now_ts();
 
         // UIDVALIDITY change invalidates all cached UIDs for this folder; force a folder resync.
-        if let Some(ref state) = folder_state {
-            if let Some(stored_uidvalidity) = state.uidvalidity {
-                if stored_uidvalidity != current_uidvalidity {
-                    warn!(
-                        account = %account.id,
-                        folder = %folder_name,
-                        old_uidvalidity = stored_uidvalidity,
-                        new_uidvalidity = current_uidvalidity,
-                        "UIDVALIDITY changed; clearing folder cache and forcing full resync"
-                    );
+        if let Some(ref state) = folder_state
+            && let Some(stored_uidvalidity) = state.uidvalidity
+            && stored_uidvalidity != current_uidvalidity
+        {
+            warn!(
+                account = %account.id,
+                folder = %folder_name,
+                old_uidvalidity = stored_uidvalidity,
+                new_uidvalidity = current_uidvalidity,
+                "UIDVALIDITY changed; clearing folder cache and forcing full resync"
+            );
 
-                    let deleted = self
-                        .db
-                        .delete_messages_by_folder(&account.id, folder_name)
-                        .await?;
+            let deleted = self
+                .db
+                .delete_messages_by_folder(&account.id, folder_name)
+                .await?;
 
-                    warn!(
-                        account = %account.id,
-                        folder = %folder_name,
-                        deleted = deleted,
-                        "Cleared cached messages for folder due to UIDVALIDITY change"
-                    );
+            warn!(
+                account = %account.id,
+                folder = %folder_name,
+                deleted = deleted,
+                "Cleared cached messages for folder due to UIDVALIDITY change"
+            );
 
-                    let updated = self
-                        .db
-                        .upsert_folder_state(
-                            &account.id,
-                            folder_name,
-                            &FolderStateUpdate {
-                                uidvalidity: Some(current_uidvalidity),
-                                highest_uid: None,
-                                highestmodseq: None,
-                                exists_count: Some(current_exists),
-                                last_sync_ts: Some(now),
-                                last_uid_scan_ts: None,
-                            },
-                        )
-                        .await?;
+            let updated = self
+                .db
+                .upsert_folder_state(
+                    &account.id,
+                    folder_name,
+                    &FolderStateUpdate {
+                        uidvalidity: Some(current_uidvalidity),
+                        highest_uid: None,
+                        highestmodseq: None,
+                        exists_count: Some(current_exists),
+                        last_sync_ts: Some(now),
+                        last_uid_scan_ts: None,
+                    },
+                )
+                .await?;
 
-                    folder_state = Some(updated);
-                }
-            }
+            folder_state = Some(updated);
         }
 
         // Build search criteria - use CONDSTORE MODSEQ for change detection
         let cutoff_str = account.settings.cutoff_since.format("%d-%b-%Y").to_string();
 
         // MODSEQ optimization: Early exit if nothing changed (unless force=true)
-        if !force {
-            if let Some(ref state) = folder_state {
-                if let (Some(stored_modseq), Some(current_modseq)) =
-                    (state.highestmodseq, current_highestmodseq)
-                {
-                    let stored_exists = state.exists_count.unwrap_or(0);
-                    if stored_modseq > 0
-                        && current_modseq == stored_modseq
-                        && stored_exists == current_exists
-                    {
-                        // No changes at all - skip sync entirely
-                        info!(
-                            account = %account.id,
-                            folder = %folder_name,
-                            modseq = current_modseq,
-                            "No changes detected (MODSEQ match) - skipping sync"
-                        );
-                        self.db
-                            .upsert_folder_state(
-                                &account.id,
-                                folder_name,
-                                &FolderStateUpdate {
-                                    uidvalidity: Some(current_uidvalidity),
-                                    highest_uid: current_highest_uid,
-                                    highestmodseq: current_highestmodseq,
-                                    exists_count: Some(current_exists),
-                                    last_sync_ts: Some(now),
-                                    last_uid_scan_ts: folder_state
-                                        .as_ref()
-                                        .and_then(|s| s.last_uid_scan_ts),
-                                },
-                            )
-                            .await?;
+        if !force
+            && let Some(ref state) = folder_state
+            && let (Some(stored_modseq), Some(current_modseq)) =
+                (state.highestmodseq, current_highestmodseq)
+        {
+            let stored_exists = state.exists_count.unwrap_or(0);
+            if stored_modseq > 0
+                && current_modseq == stored_modseq
+                && stored_exists == current_exists
+            {
+                // No changes at all - skip sync entirely
+                info!(
+                    account = %account.id,
+                    folder = %folder_name,
+                    modseq = current_modseq,
+                    "No changes detected (MODSEQ match) - skipping sync"
+                );
+                self.db
+                    .upsert_folder_state(
+                        &account.id,
+                        folder_name,
+                        &FolderStateUpdate {
+                            uidvalidity: Some(current_uidvalidity),
+                            highest_uid: current_highest_uid,
+                            highestmodseq: current_highestmodseq,
+                            exists_count: Some(current_exists),
+                            last_sync_ts: Some(now),
+                            last_uid_scan_ts: folder_state
+                                .as_ref()
+                                .and_then(|s| s.last_uid_scan_ts),
+                        },
+                    )
+                    .await?;
 
-                        return Ok(FolderSyncReport {
-                            folder: folder_name.to_string(),
-                            expunged_uids: Vec::new(),
-                        });
-                    }
-                }
+                return Ok(FolderSyncReport {
+                    folder: folder_name.to_string(),
+                    expunged_uids: Vec::new(),
+                });
             }
         }
 
@@ -475,22 +472,19 @@ impl SyncEngine {
                     .map(|ts| now.saturating_sub(ts) > EXPUNGE_SCAN_INTERVAL_SECS)
                     .unwrap_or(true);
 
-            if should_uid_scan {
-                match self
+            if should_uid_scan
+                && let Ok(uids) = self
                     .scan_expunged_uids(session, &account.id, folder_name, &cutoff_str)
                     .await
-                {
-                    Ok(uids) => {
-                        expunged_uids = uids;
-                        last_uid_scan_ts = Some(now);
-                    }
-                    Err(e) => warn!(
-                        account = %account.id,
-                        folder = %folder_name,
-                        error = %e,
-                        "Expunge scan failed"
-                    ),
-                }
+            {
+                expunged_uids = uids;
+                last_uid_scan_ts = Some(now);
+            } else if should_uid_scan {
+                warn!(
+                    account = %account.id,
+                    folder = %folder_name,
+                    "Expunge scan failed"
+                );
             }
 
             let highest_uid = current_highest_uid.unwrap_or(stored_highest_uid);
@@ -646,8 +640,7 @@ impl SyncEngine {
             );
 
             // Fetch metadata + bodies
-            let fetch_query =
-                "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[] ENVELOPE X-GM-MSGID X-GM-THRID X-GM-LABELS)";
+            let fetch_query = "(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[] ENVELOPE X-GM-MSGID X-GM-THRID X-GM-LABELS)";
 
             let fetch_start = Instant::now();
             let mut stream = session
@@ -833,21 +826,19 @@ impl SyncEngine {
                 // Clean up legacy duplicates (old fallback ids) now that we have stable ids + raw_hash.
                 // This is intentionally conservative: it only removes legacy ids (contain ':') when
                 // a stable numeric id row exists for the same raw bytes.
-                if account.provider == crate::types::Provider::GmailImap {
-                    if let Ok(n) = self
+                if account.provider == crate::types::Provider::GmailImap
+                    && let Ok(n) = self
                         .db
                         .dedupe_fallback_messages_by_raw_hash(&account.id, 500)
                         .await
-                    {
-                        if n > 0 {
-                            debug!(
-                                account = %account.id,
-                                folder = %folder_name,
-                                deleted = n,
-                                "Deduped legacy messages after batch insert"
-                            );
-                        }
-                    }
+                    && n > 0
+                {
+                    debug!(
+                        account = %account.id,
+                        folder = %folder_name,
+                        deleted = n,
+                        "Deduped legacy messages after batch insert"
+                    );
                 }
 
                 info!(

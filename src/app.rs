@@ -7,7 +7,7 @@ use crate::tui;
 use crate::types::Account;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use tracing::{info, warn};
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -77,25 +77,25 @@ pub async fn run(cli: Cli) -> Result<()> {
             println!("   From: {}", from);
             println!("   Folder: {}", msg.folder);
 
-            if let Some(body_record) = body {
-                if let Some(text) = &body_record.sanitized_text {
-                    let preview = text
-                        .lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .take(2)
-                        .collect::<Vec<_>>()
-                        .join(" ");
+            if let Some(body_record) = body
+                && let Some(text) = &body_record.sanitized_text
+            {
+                let preview = text
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ");
 
-                    let preview = if preview.chars().count() > 100 {
-                        let truncated: String = preview.chars().take(100).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        preview
-                    };
+                let preview = if preview.chars().count() > 100 {
+                    let truncated: String = preview.chars().take(100).collect();
+                    format!("{}...", truncated)
+                } else {
+                    preview
+                };
 
-                    if !preview.is_empty() {
-                        println!("   Preview: {}", preview);
-                    }
+                if !preview.is_empty() {
+                    println!("   Preview: {}", preview);
                 }
             }
 

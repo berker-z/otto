@@ -4,8 +4,8 @@ use async_imap::{Authenticator, Client, Session};
 use rustls_native_certs::load_native_certs;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerName};
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerName};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::types::Account;
