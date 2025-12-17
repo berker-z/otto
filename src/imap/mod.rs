@@ -16,7 +16,8 @@ impl ImapClient {
     pub async fn connect(
         account: &Account,
         access_token: &str,
-    ) -> Result<Session<tokio_util::compat::Compat<tokio_rustls::client::TlsStream<TcpStream>>>> {
+    ) -> Result<Session<tokio_util::compat::Compat<tokio_rustls::client::TlsStream<TcpStream>>>>
+    {
         // Create TLS config with native root certificates
         let mut root_store = RootCertStore::empty();
         for cert in load_native_certs().context("failed to load native certs")? {
@@ -38,8 +39,7 @@ impl ImapClient {
             .context("connecting to imap.gmail.com:993")?;
 
         // Upgrade to TLS
-        let server_name = ServerName::try_from("imap.gmail.com")
-            .context("invalid DNS name")?;
+        let server_name = ServerName::try_from("imap.gmail.com").context("invalid DNS name")?;
         let tls_stream = connector
             .connect(server_name, tcp)
             .await

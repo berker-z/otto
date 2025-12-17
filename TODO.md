@@ -24,3 +24,4 @@
 - UIDVALIDITY change now clears folder cache and rebuilds baseline.
 - Expunge fallback now runs a periodic UID scan and purges missing UIDs after folder syncs complete.
 - MIME summaries and attachment metadata are now populated; label refresh is included in flag updates.
+- TUI now launches immediately from cached messages, shows a top-bar spinner during background sync, and refreshes from the DB when sync completes.

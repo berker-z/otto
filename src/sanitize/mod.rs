@@ -74,7 +74,12 @@ fn summarize_mime(parsed: &ParsedMail) -> (String, Vec<AttachmentMeta>) {
     (summary, attachments)
 }
 
-fn walk_mime(part: &ParsedMail, depth: usize, lines: &mut Vec<String>, attachments: &mut Vec<AttachmentMeta>) {
+fn walk_mime(
+    part: &ParsedMail,
+    depth: usize,
+    lines: &mut Vec<String>,
+    attachments: &mut Vec<AttachmentMeta>,
+) {
     // Hard cap to avoid pathological MIME blowing up output.
     if lines.len() > 300 || depth > 20 {
         return;
@@ -116,7 +121,14 @@ fn walk_mime(part: &ParsedMail, depth: usize, lines: &mut Vec<String>, attachmen
     lines.push(line);
 
     let is_container = ctype.mimetype.starts_with("multipart/") && !part.subparts.is_empty();
-    if !is_container && is_attachment_part(&ctype.mimetype, &disp.disposition, filename.as_deref(), content_id.as_deref()) {
+    if !is_container
+        && is_attachment_part(
+            &ctype.mimetype,
+            &disp.disposition,
+            filename.as_deref(),
+            content_id.as_deref(),
+        )
+    {
         attachments.push(AttachmentMeta {
             filename,
             mime_type: ctype.mimetype.clone(),
@@ -146,16 +158,14 @@ fn extract_filename(part: &ParsedMail) -> Option<String> {
         .or_else(|| part.ctype.params.get("filename"))
         .cloned();
 
-    disp_name
-        .or(ctype_name)
-        .and_then(|v| {
-            let trimmed = v.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
+    disp_name.or(ctype_name).and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn disp_to_string(disp: &DispositionType) -> String {
@@ -222,7 +232,11 @@ fn html_to_text(html: &[u8]) -> String {
     from_read(html, 80).unwrap_or_default()
 }
 
-pub fn build_body_record(message_id: &str, raw: Option<Vec<u8>>, sanitized: SanitizedBody) -> BodyRecord {
+pub fn build_body_record(
+    message_id: &str,
+    raw: Option<Vec<u8>>,
+    sanitized: SanitizedBody,
+) -> BodyRecord {
     BodyRecord {
         message_id: message_id.to_string(),
         raw_rfc822: raw,

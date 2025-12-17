@@ -3,7 +3,6 @@ use clap::Parser;
 use otto::app;
 use otto::cli::Cli;
 
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env file if it exists

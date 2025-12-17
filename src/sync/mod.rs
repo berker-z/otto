@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use futures::{StreamExt, future::join_all};
+use futures::{future::join_all, StreamExt};
 use oauth2::Scope;
 use once_cell::sync::Lazy;
 use tokio::net::TcpStream;
@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use crate::imap::ImapClient;
 use crate::oauth::authorize_with_scopes;
 use crate::sanitize::sanitize_message;
-use crate::storage::Database;
+use crate::storage::{db::FolderStateUpdate, db::MessageLocationUpdate, Database};
 use crate::types::{now_ts, Account, BodyRecord, MessageRecord};
 
 type ImapSession = async_imap::Session<Compat<tokio_rustls::client::TlsStream<TcpStream>>>;
@@ -120,7 +120,6 @@ impl SyncEngine {
                 let account = account.clone();
                 let folder_name = folder_name.clone();
                 let access_token = token.access_token.clone();
-                let force = force;
 
                 tokio::spawn(async move {
                     let folder_start = Instant::now();
@@ -194,7 +193,11 @@ impl SyncEngine {
 
             let deleted = self
                 .db
-                .delete_messages_by_folder_and_uids(&account.id, &report.folder, &report.expunged_uids)
+                .delete_messages_by_folder_and_uids(
+                    &account.id,
+                    &report.folder,
+                    &report.expunged_uids,
+                )
                 .await?;
 
             info!(
@@ -302,12 +305,14 @@ impl SyncEngine {
                         .upsert_folder_state(
                             &account.id,
                             folder_name,
-                            Some(current_uidvalidity),
-                            None,
-                            None,
-                            Some(current_exists),
-                            Some(now),
-                            None,
+                            &FolderStateUpdate {
+                                uidvalidity: Some(current_uidvalidity),
+                                highest_uid: None,
+                                highestmodseq: None,
+                                exists_count: Some(current_exists),
+                                last_sync_ts: Some(now),
+                                last_uid_scan_ts: None,
+                            },
                         )
                         .await?;
 
@@ -322,9 +327,14 @@ impl SyncEngine {
         // MODSEQ optimization: Early exit if nothing changed (unless force=true)
         if !force {
             if let Some(ref state) = folder_state {
-                if let (Some(stored_modseq), Some(current_modseq)) = (state.highestmodseq, current_highestmodseq) {
+                if let (Some(stored_modseq), Some(current_modseq)) =
+                    (state.highestmodseq, current_highestmodseq)
+                {
                     let stored_exists = state.exists_count.unwrap_or(0);
-                    if stored_modseq > 0 && current_modseq == stored_modseq && stored_exists == current_exists {
+                    if stored_modseq > 0
+                        && current_modseq == stored_modseq
+                        && stored_exists == current_exists
+                    {
                         // No changes at all - skip sync entirely
                         info!(
                             account = %account.id,
@@ -336,12 +346,16 @@ impl SyncEngine {
                             .upsert_folder_state(
                                 &account.id,
                                 folder_name,
-                                Some(current_uidvalidity),
-                                current_highest_uid,
-                                current_highestmodseq,
-                                Some(current_exists),
-                                Some(now),
-                                folder_state.as_ref().and_then(|s| s.last_uid_scan_ts),
+                                &FolderStateUpdate {
+                                    uidvalidity: Some(current_uidvalidity),
+                                    highest_uid: current_highest_uid,
+                                    highestmodseq: current_highestmodseq,
+                                    exists_count: Some(current_exists),
+                                    last_sync_ts: Some(now),
+                                    last_uid_scan_ts: folder_state
+                                        .as_ref()
+                                        .and_then(|s| s.last_uid_scan_ts),
+                                },
                             )
                             .await?;
 
@@ -355,9 +369,18 @@ impl SyncEngine {
         }
 
         // Incremental path: use MODSEQ search to fetch only changed UIDs.
-        let stored_modseq = folder_state.as_ref().and_then(|s| s.highestmodseq).unwrap_or(0);
-        let stored_highest_uid = folder_state.as_ref().and_then(|s| s.highest_uid).unwrap_or(0);
-        let stored_exists = folder_state.as_ref().and_then(|s| s.exists_count).unwrap_or(0);
+        let stored_modseq = folder_state
+            .as_ref()
+            .and_then(|s| s.highestmodseq)
+            .unwrap_or(0);
+        let stored_highest_uid = folder_state
+            .as_ref()
+            .and_then(|s| s.highest_uid)
+            .unwrap_or(0);
+        let stored_exists = folder_state
+            .as_ref()
+            .and_then(|s| s.exists_count)
+            .unwrap_or(0);
         let stored_last_uid_scan_ts = folder_state.as_ref().and_then(|s| s.last_uid_scan_ts);
 
         if stored_modseq == 0 || current_highestmodseq.is_none() {
@@ -395,10 +418,7 @@ impl SyncEngine {
                     .await?;
             }
 
-            let expunged_uids: Vec<u32> = local_uids
-                .difference(&remote_uids)
-                .copied()
-                .collect();
+            let expunged_uids: Vec<u32> = local_uids.difference(&remote_uids).copied().collect();
 
             let highest_uid = current_highest_uid
                 .or_else(|| remote_uids.iter().max().copied())
@@ -408,12 +428,14 @@ impl SyncEngine {
                 .upsert_folder_state(
                     &account.id,
                     folder_name,
-                    Some(current_uidvalidity),
-                    Some(highest_uid),
-                    current_highestmodseq,
-                    Some(current_exists),
-                    Some(now),
-                    Some(now),
+                    &FolderStateUpdate {
+                        uidvalidity: Some(current_uidvalidity),
+                        highest_uid: Some(highest_uid),
+                        highestmodseq: current_highestmodseq,
+                        exists_count: Some(current_exists),
+                        last_sync_ts: Some(now),
+                        last_uid_scan_ts: Some(now),
+                    },
                 )
                 .await?;
 
@@ -476,12 +498,14 @@ impl SyncEngine {
                 .upsert_folder_state(
                     &account.id,
                     folder_name,
-                    Some(current_uidvalidity),
-                    Some(highest_uid),
-                    current_highestmodseq,
-                    Some(current_exists),
-                    Some(now),
-                    last_uid_scan_ts,
+                    &FolderStateUpdate {
+                        uidvalidity: Some(current_uidvalidity),
+                        highest_uid: Some(highest_uid),
+                        highestmodseq: current_highestmodseq,
+                        exists_count: Some(current_exists),
+                        last_sync_ts: Some(now),
+                        last_uid_scan_ts,
+                    },
                 )
                 .await?;
             return Ok(FolderSyncReport {
@@ -556,12 +580,14 @@ impl SyncEngine {
             .upsert_folder_state(
                 &account.id,
                 folder_name,
-                Some(current_uidvalidity),
-                Some(highest_uid),
-                current_highestmodseq,
-                Some(current_exists),
-                Some(now),
-                last_uid_scan_ts,
+                &FolderStateUpdate {
+                    uidvalidity: Some(current_uidvalidity),
+                    highest_uid: Some(highest_uid),
+                    highestmodseq: current_highestmodseq,
+                    exists_count: Some(current_exists),
+                    last_sync_ts: Some(now),
+                    last_uid_scan_ts,
+                },
             )
             .await?;
 
@@ -657,12 +683,14 @@ impl SyncEngine {
                 let labels = Self::extract_gm_labels(&fetch);
 
                 // Extract envelope data as owned values (Envelope doesn't implement Clone)
-                let envelope_subject = fetch.envelope()
+                let envelope_subject = fetch
+                    .envelope()
                     .and_then(|e| e.subject.as_ref())
                     .and_then(|s| std::str::from_utf8(s).ok())
                     .map(|s| s.to_string());
 
-                let envelope_from = fetch.envelope()
+                let envelope_from = fetch
+                    .envelope()
                     .and_then(|e| e.from.as_ref())
                     .and_then(|addrs| addrs.first())
                     .and_then(|addr| {
@@ -672,7 +700,18 @@ impl SyncEngine {
                             .map(|m| m.to_string())
                     });
 
-                raw_fetches.push((uid, body, envelope_subject, envelope_from, flags, size, internal_date, gm_msgid, gm_thrid, labels));
+                raw_fetches.push((
+                    uid,
+                    body,
+                    envelope_subject,
+                    envelope_from,
+                    flags,
+                    size,
+                    internal_date,
+                    gm_msgid,
+                    gm_thrid,
+                    labels,
+                ));
             }
 
             debug!(
@@ -693,57 +732,70 @@ impl SyncEngine {
                     use rayon::prelude::*;
                     raw_fetches
                         .into_par_iter()
-                        .map(|(uid, body, envelope_subject, envelope_from, flags, size, internal_date, gm_msgid, gm_thrid, labels)| {
-                            // Parse MIME (CPU-intensive)
-                            let parsed = mailparse::parse_mail(&body)
-                                .with_context(|| format!("parsing MIME for UID {}", uid))?;
-
-                            // Sanitize (CPU-intensive)
-                            let sanitized = sanitize_message(&parsed, &body);
-
-                            // Use pre-extracted envelope data or fallback to headers
-                            let subject = envelope_subject
-                                .as_ref()
-                                .and_then(|s| decode_mime_header(s))
-                                .or_else(|| get_header_value(&parsed, "Subject"));
-
-                            let from = envelope_from
-                                .or_else(|| get_header_value(&parsed, "From"));
-
-                            // Build message record
-                            let message_id = gm_msgid.unwrap_or_else(|| {
-                                format!("{}:{}:{}", account_id, folder_name_owned, uid)
-                            });
-
-                            let message = MessageRecord {
-                                id: message_id.clone(),
-                                account_id: account_id.clone(),
-                                folder: folder_name_owned.clone(),
-                                uid: Some(uid),
-                                thread_id: gm_thrid,
-                                internal_date,
-                                subject,
-                                from,
-                                to: get_header_value(&parsed, "To"),
-                                cc: get_header_value(&parsed, "Cc"),
-                                bcc: get_header_value(&parsed, "Bcc"),
+                        .map(
+                            |(
+                                uid,
+                                body,
+                                envelope_subject,
+                                envelope_from,
                                 flags,
+                                size,
+                                internal_date,
+                                gm_msgid,
+                                gm_thrid,
                                 labels,
-                                has_attachments: sanitized.has_attachments,
-                                size_bytes: Some(size),
-                                raw_hash: Some(sanitized.raw_hash.clone()),
-                                created_at: now_ts(),
-                                updated_at: now_ts(),
-                            };
+                            )| {
+                                // Parse MIME (CPU-intensive)
+                                let parsed = mailparse::parse_mail(&body)
+                                    .with_context(|| format!("parsing MIME for UID {}", uid))?;
 
-                            let body_record = crate::sanitize::build_body_record(
-                                &message_id,
-                                Some(body),
-                                sanitized,
-                            );
+                                // Sanitize (CPU-intensive)
+                                let sanitized = sanitize_message(&parsed, &body);
 
-                            Ok((message, body_record))
-                        })
+                                // Use pre-extracted envelope data or fallback to headers
+                                let subject = envelope_subject
+                                    .as_ref()
+                                    .and_then(|s| decode_mime_header(s))
+                                    .or_else(|| get_header_value(&parsed, "Subject"));
+
+                                let from =
+                                    envelope_from.or_else(|| get_header_value(&parsed, "From"));
+
+                                // Build message record
+                                let message_id = gm_msgid.unwrap_or_else(|| {
+                                    format!("{}:{}:{}", account_id, folder_name_owned, uid)
+                                });
+
+                                let message = MessageRecord {
+                                    id: message_id.clone(),
+                                    account_id: account_id.clone(),
+                                    folder: folder_name_owned.clone(),
+                                    uid: Some(uid),
+                                    thread_id: gm_thrid,
+                                    internal_date,
+                                    subject,
+                                    from,
+                                    to: get_header_value(&parsed, "To"),
+                                    cc: get_header_value(&parsed, "Cc"),
+                                    bcc: get_header_value(&parsed, "Bcc"),
+                                    flags,
+                                    labels,
+                                    has_attachments: sanitized.has_attachments,
+                                    size_bytes: Some(size),
+                                    raw_hash: Some(sanitized.raw_hash.clone()),
+                                    created_at: now_ts(),
+                                    updated_at: now_ts(),
+                                };
+
+                                let body_record = crate::sanitize::build_body_record(
+                                    &message_id,
+                                    Some(body),
+                                    sanitized,
+                                );
+
+                                Ok((message, body_record))
+                            },
+                        )
                         .collect()
                 })
                 .await
@@ -774,7 +826,9 @@ impl SyncEngine {
             if !messages_batch.is_empty() {
                 let write_start = Instant::now();
 
-                self.db.batch_upsert_messages_with_bodies(&messages_batch, &bodies_batch).await?;
+                self.db
+                    .batch_upsert_messages_with_bodies(&messages_batch, &bodies_batch)
+                    .await?;
 
                 // Clean up legacy duplicates (old fallback ids) now that we have stable ids + raw_hash.
                 // This is intentionally conservative: it only removes legacy ids (contain ':') when
@@ -822,20 +876,12 @@ impl SyncEngine {
         const BATCH_SIZE: usize = 250;
 
         let mut need_body: Vec<u32> = Vec::new();
-        let mut location_updates: Vec<(
-            String,
-            String,
-            u32,
-            Vec<String>,
-            Vec<String>,
-            Option<String>,
-            Option<i64>,
-            Option<u32>,
-        )> = Vec::new();
+        let mut location_updates: Vec<MessageLocationUpdate> = Vec::new();
 
         for chunk in uids.chunks(BATCH_SIZE) {
             let uid_seq = Self::build_uid_sequence(chunk);
-            let fetch_query = "(UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE X-GM-MSGID X-GM-THRID X-GM-LABELS)";
+            let fetch_query =
+                "(UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE X-GM-MSGID X-GM-THRID X-GM-LABELS)";
 
             let mut stream = session
                 .uid_fetch(&uid_seq, fetch_query)
@@ -864,18 +910,28 @@ impl SyncEngine {
                 let size = fetch.size;
                 let internal_date = fetch.internal_date().map(|dt| dt.timestamp());
 
-                let message_id = gm_msgid.unwrap_or_else(|| {
-                    format!("{}:{}:{}", account.id, folder_name, uid)
-                });
+                let message_id =
+                    gm_msgid.unwrap_or_else(|| format!("{}:{}:{}", account.id, folder_name, uid));
 
-                batch.push((uid, message_id, flags, labels, gm_thrid, internal_date, size));
+                batch.push((
+                    uid,
+                    message_id,
+                    flags,
+                    labels,
+                    gm_thrid,
+                    internal_date,
+                    size,
+                ));
             }
 
             if batch.is_empty() {
                 continue;
             }
 
-            let ids: Vec<String> = batch.iter().map(|(_, id, _, _, _, _, _)| id.clone()).collect();
+            let ids: Vec<String> = batch
+                .iter()
+                .map(|(_, id, _, _, _, _, _)| id.clone())
+                .collect();
             let existing = self.db.load_existing_message_ids(&account.id, &ids).await?;
 
             for (uid, message_id, flags, labels, thread_id, internal_date, size) in batch {
@@ -954,10 +1010,7 @@ impl SyncEngine {
                 };
 
                 let uid = fetch.uid.unwrap_or(0);
-                let _flags: Vec<String> = fetch
-                    .flags()
-                    .map(|f| format!("{:?}", f))
-                    .collect();
+                let _flags: Vec<String> = fetch.flags().map(|f| format!("{:?}", f)).collect();
                 let _labels = Self::extract_gm_labels(&fetch);
 
                 // TODO: Load existing message and compare flags/labels
@@ -1067,7 +1120,9 @@ fn decode_mime_header(header: &str) -> Option<String> {
     // This handles both quoted-printable and base64 encoded words
     let header_str = format!("Subject: {}\r\n\r\n", header);
     if let Ok(parsed) = mailparse::parse_mail(header_str.as_bytes()) {
-        parsed.headers.iter()
+        parsed
+            .headers
+            .iter()
             .find(|h| h.get_key().eq_ignore_ascii_case("Subject"))
             .map(|h| h.get_value())
     } else {

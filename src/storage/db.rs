@@ -12,6 +12,27 @@ use tracing::warn;
 
 const DB_FILE_NAME: &str = "otto.db";
 
+#[derive(Clone, Debug, Default)]
+pub struct FolderStateUpdate {
+    pub uidvalidity: Option<u32>,
+    pub highest_uid: Option<u32>,
+    pub highestmodseq: Option<u64>,
+    pub exists_count: Option<u32>,
+    pub last_sync_ts: Option<i64>,
+    pub last_uid_scan_ts: Option<i64>,
+}
+
+pub type MessageLocationUpdate = (
+    String,
+    String,
+    u32,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+    Option<i64>,
+    Option<u32>,
+);
+
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
@@ -238,12 +259,7 @@ impl Database {
         &self,
         account_id: &str,
         name: &str,
-        uidvalidity: Option<u32>,
-        highest_uid: Option<u32>,
-        highestmodseq: Option<u64>,
-        exists_count: Option<u32>,
-        last_sync_ts: Option<i64>,
-        last_uid_scan_ts: Option<i64>,
+        update: &FolderStateUpdate,
     ) -> Result<FolderState> {
         let now = now_ts();
         sqlx::query(
@@ -262,12 +278,12 @@ impl Database {
         )
         .bind(account_id)
         .bind(name)
-        .bind(uidvalidity.map(|v| v as i64))
-        .bind(highest_uid.map(|v| v as i64))
-        .bind(highestmodseq.map(|v| v as i64))
-        .bind(exists_count.map(|v| v as i64))
-        .bind(last_sync_ts)
-        .bind(last_uid_scan_ts)
+        .bind(update.uidvalidity.map(|v| v as i64))
+        .bind(update.highest_uid.map(|v| v as i64))
+        .bind(update.highestmodseq.map(|v| v as i64))
+        .bind(update.exists_count.map(|v| v as i64))
+        .bind(update.last_sync_ts)
+        .bind(update.last_uid_scan_ts)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -291,18 +307,10 @@ impl Database {
             id: row.get::<i64, _>(0),
             account_id: account_id.to_string(),
             name: name.to_string(),
-            uidvalidity: row
-                .get::<Option<i64>, _>(1)
-                .map(|v| v as u32),
-            highest_uid: row
-                .get::<Option<i64>, _>(2)
-                .map(|v| v as u32),
-            highestmodseq: row
-                .get::<Option<i64>, _>(3)
-                .map(|v| v as u64),
-            exists_count: row
-                .get::<Option<i64>, _>(4)
-                .map(|v| v as u32),
+            uidvalidity: row.get::<Option<i64>, _>(1).map(|v| v as u32),
+            highest_uid: row.get::<Option<i64>, _>(2).map(|v| v as u32),
+            highestmodseq: row.get::<Option<i64>, _>(3).map(|v| v as u64),
+            exists_count: row.get::<Option<i64>, _>(4).map(|v| v as u32),
             last_sync_ts: row.get::<Option<i64>, _>(5),
             last_uid_scan_ts: row.get::<Option<i64>, _>(6),
         })
@@ -328,18 +336,10 @@ impl Database {
                 id: row.get(0),
                 account_id: account_id.to_string(),
                 name: row.get(1),
-                uidvalidity: row
-                    .get::<Option<i64>, _>(2)
-                    .map(|v| v as u32),
-                highest_uid: row
-                    .get::<Option<i64>, _>(3)
-                    .map(|v| v as u32),
-                highestmodseq: row
-                    .get::<Option<i64>, _>(4)
-                    .map(|v| v as u64),
-                exists_count: row
-                    .get::<Option<i64>, _>(5)
-                    .map(|v| v as u32),
+                uidvalidity: row.get::<Option<i64>, _>(2).map(|v| v as u32),
+                highest_uid: row.get::<Option<i64>, _>(3).map(|v| v as u32),
+                highestmodseq: row.get::<Option<i64>, _>(4).map(|v| v as u64),
+                exists_count: row.get::<Option<i64>, _>(5).map(|v| v as u32),
                 last_sync_ts: row.get(6),
                 last_uid_scan_ts: row.get(7),
             });
@@ -359,9 +359,8 @@ impl Database {
             return Ok(HashMap::new());
         }
 
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT uid, id FROM messages WHERE account_id = ",
-        );
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT uid, id FROM messages WHERE account_id = ");
         qb.push_bind(account_id);
         qb.push(" AND folder = ");
         qb.push_bind(folder);
@@ -382,10 +381,7 @@ impl Database {
 
         let mut out = HashMap::new();
         for row in rows {
-            let uid = row
-                .get::<Option<i64>, _>(0)
-                .map(|v| v as u32)
-                .unwrap_or(0);
+            let uid = row.get::<Option<i64>, _>(0).map(|v| v as u32).unwrap_or(0);
             let id: String = row.get(1);
             if uid > 0 {
                 out.insert(uid, id);
@@ -417,10 +413,7 @@ impl Database {
 
         let mut out = HashMap::new();
         for row in rows {
-            let uid = row
-                .get::<Option<i64>, _>(0)
-                .map(|v| v as u32)
-                .unwrap_or(0);
+            let uid = row.get::<Option<i64>, _>(0).map(|v| v as u32).unwrap_or(0);
             let id: String = row.get(1);
             if uid > 0 {
                 out.insert(uid, id);
@@ -505,16 +498,7 @@ impl Database {
     pub async fn batch_update_message_location_by_id(
         &self,
         account_id: &str,
-        updates: &[(
-            String,
-            String,
-            u32,
-            Vec<String>,
-            Vec<String>,
-            Option<String>,
-            Option<i64>,
-            Option<u32>,
-        )],
+        updates: &[MessageLocationUpdate],
     ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
@@ -523,7 +507,8 @@ impl Database {
         let now = now_ts();
         let mut tx = self.pool.begin().await.context("beginning transaction")?;
 
-        for (message_id, folder, uid, flags, labels, thread_id, internal_date, size_bytes) in updates
+        for (message_id, folder, uid, flags, labels, thread_id, internal_date, size_bytes) in
+            updates
         {
             sqlx::query(
                 r#"

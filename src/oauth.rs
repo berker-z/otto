@@ -35,7 +35,9 @@ pub async fn authorize_with_scopes(scopes: &[Scope], token_key: &str) -> AppResu
     let token_store = TokenStore::from_key(token_key);
 
     if let Some(refresh) = token_store.load()? {
-        if let Some(bundle) = try_refresh(&build_client(&creds, &pick_redirect_uri()?)?, refresh).await? {
+        if let Some(bundle) =
+            try_refresh(&build_client(&creds, &pick_redirect_uri()?)?, refresh).await?
+        {
             return Ok(bundle);
         }
         warn!(account = %token_key, "Stored refresh token failed; re-authenticating");

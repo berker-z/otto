@@ -4,9 +4,10 @@ use crate::onboarding;
 use crate::storage::Database;
 use crate::sync::SyncEngine;
 use crate::tui;
+use crate::types::Account;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use tracing::{info, warn};
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -28,26 +29,16 @@ pub async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if cli.tui {
+        launch_tui(&cli, &accounts, db.clone()).await?;
+        return Ok(());
+    }
+
     if !cli.no_sync {
         let engine = SyncEngine::new(db.clone());
         engine.sync_all(&accounts, cli.force).await?;
     } else {
         info!("Skipping sync; using cached data only");
-    }
-
-    if cli.tui {
-        // For now, show latest messages for the first account as a TUI overlay.
-        if let Some(account) = accounts.first() {
-            let messages = db.load_messages(&account.id, 50).await?;
-            let mail_items = tui::build_mail_items(&messages);
-            let state = tui::TuiState { mail_items };
-
-            // Run blocking TUI inside the async runtime.
-            tokio::task::block_in_place(|| tui::run(state))?;
-        } else {
-            warn!("No accounts available for TUI; falling back to simple list.");
-        }
-        return Ok(());
     }
 
     // Display latest 10 emails
@@ -64,7 +55,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         for (i, (msg, body)) in messages.iter().enumerate() {
-            let date = msg.internal_date
+            let date = msg
+                .internal_date
                 .map(|ts| {
                     DateTime::<Utc>::from_timestamp(ts, 0)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
@@ -78,10 +70,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Decode MIME-encoded subjects for display
             let subject = decode_mime_words(subject);
 
-            let is_read = msg
-                .flags
-                .iter()
-                .any(|f| f.eq("Seen") || f.eq("\\Seen"));
+            let is_read = msg.flags.iter().any(|f| f.eq("Seen") || f.eq("\\Seen"));
             let status = if is_read { "R" } else { "U" };
 
             println!("{}. [{}] [{}] {}", i + 1, date, status, subject);
@@ -115,6 +104,56 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     println!("{}", "=".repeat(80));
+
+    Ok(())
+}
+
+async fn launch_tui(cli: &Cli, accounts: &[Account], db: Arc<Database>) -> Result<()> {
+    if let Some(account) = accounts.first() {
+        let messages = db.load_messages(&account.id, 50).await?;
+        let mail_items = tui::build_mail_items(&messages);
+        let (update_tx, update_rx) = mpsc::channel();
+
+        if !cli.no_sync {
+            let start_tx = update_tx.clone();
+            let sync_tx = update_tx.clone();
+            let db_for_sync = db.clone();
+            let accounts_for_sync = accounts.to_vec();
+            let account_id = account.id.clone();
+            let force = cli.force;
+
+            let _ = start_tx.send(tui::TuiEvent::SyncStarted);
+
+            tokio::spawn(async move {
+                let engine = SyncEngine::new(db_for_sync.clone());
+                if let Err(e) = engine.sync_all(&accounts_for_sync, force).await {
+                    warn!(error = %e, "Background sync failed");
+                }
+                let _ = sync_tx.send(tui::TuiEvent::SyncFinished);
+
+                match db_for_sync.load_messages(&account_id, 50).await {
+                    Ok(messages) => {
+                        let items = tui::build_mail_items(&messages);
+                        let _ = sync_tx.send(tui::TuiEvent::MailItems(items));
+                    }
+                    Err(e) => {
+                        warn!(account = %account_id, error = %e, "Reloading messages after sync failed");
+                    }
+                }
+            });
+        } else {
+            info!("Skipping sync; TUI will use cached data only");
+        }
+
+        let state = tui::TuiState {
+            mail_items,
+            updates: Some(update_rx),
+        };
+
+        tokio::task::block_in_place(|| tui::run(state))?;
+    } else {
+        warn!("No accounts available for TUI; falling back to simple list.");
+    }
 
     Ok(())
 }
@@ -220,7 +259,7 @@ fn decode_quoted_printable_rfc2047(text: &str) -> Option<String> {
         match bytes[i] {
             b'=' if i + 2 < bytes.len() => {
                 // Try to decode hex
-                let hex_str = std::str::from_utf8(&bytes[i+1..i+3]).ok()?;
+                let hex_str = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
                 if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
                     result.push(byte);
                     i += 3;

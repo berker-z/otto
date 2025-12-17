@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -26,23 +27,38 @@ pub struct MailItem {
 
 pub struct TuiState {
     pub mail_items: Vec<MailItem>,
+    pub updates: Option<Receiver<TuiEvent>>,
 }
 
 struct App {
+    updates: Option<Receiver<TuiEvent>>,
     tabs: Vec<&'static str>,
     selected_tab: usize,
     selected_mail: usize,
     mail_items: Vec<MailItem>,
+    sync_in_progress: bool,
+    spinner_index: usize,
     last_tick: Instant,
 }
 
+pub enum TuiEvent {
+    SyncStarted,
+    SyncFinished,
+    MailItems(Vec<MailItem>),
+}
+
+const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+
 impl App {
-    fn new(mail_items: Vec<MailItem>) -> Self {
+    fn new(mail_items: Vec<MailItem>, updates: Option<Receiver<TuiEvent>>) -> Self {
         Self {
+            updates,
             tabs: vec!["Calendar", "Mail", "Notes", "Projects"],
             selected_tab: 1, // Mail
             selected_mail: 0,
             mail_items,
+            sync_in_progress: false,
+            spinner_index: 0,
             last_tick: Instant::now(),
         }
     }
@@ -61,6 +77,44 @@ impl App {
         if self.selected_mail > 0 {
             self.selected_mail -= 1;
         }
+    }
+
+    fn drain_updates(&mut self) {
+        if let Some(rx) = self.updates.take() {
+            while let Ok(event) = rx.try_recv() {
+                self.apply_event(event);
+            }
+            self.updates = Some(rx);
+        }
+    }
+
+    fn apply_event(&mut self, event: TuiEvent) {
+        match event {
+            TuiEvent::SyncStarted => {
+                self.sync_in_progress = true;
+            }
+            TuiEvent::SyncFinished => {
+                self.sync_in_progress = false;
+            }
+            TuiEvent::MailItems(items) => {
+                self.mail_items = items;
+                if self.mail_items.is_empty() {
+                    self.selected_mail = 0;
+                } else if self.selected_mail >= self.mail_items.len() {
+                    self.selected_mail = self.mail_items.len() - 1;
+                }
+            }
+        }
+    }
+
+    fn advance_spinner(&mut self) {
+        if self.sync_in_progress {
+            self.spinner_index = (self.spinner_index + 1) % SPINNER_FRAMES.len();
+        }
+    }
+
+    fn spinner_frame(&self) -> &str {
+        SPINNER_FRAMES[self.spinner_index % SPINNER_FRAMES.len()]
     }
 }
 
@@ -92,10 +146,11 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: TuiState,
 ) -> Result<()> {
-    let mut app = App::new(state.mail_items);
+    let mut app = App::new(state.mail_items, state.updates);
     let tick_rate = Duration::from_millis(200);
 
     loop {
+        app.drain_updates();
         terminal.draw(|f| draw(f, &app))?;
 
         let timeout = tick_rate
@@ -112,6 +167,7 @@ fn run_app<B: ratatui::backend::Backend>(
 
         if app.last_tick.elapsed() >= tick_rate {
             app.last_tick = Instant::now();
+            app.advance_spinner();
         }
     }
 
@@ -157,14 +213,20 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 }
 
 fn draw_top_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let titles: Vec<Line> = app
-        .tabs
-        .iter()
-        .map(|t| Line::from(Span::raw(*t)))
-        .collect();
+    let titles: Vec<Line> = app.tabs.iter().map(|t| Line::from(Span::raw(*t))).collect();
+
+    let title_text = if app.sync_in_progress {
+        format!("Otto | Syncing {}", app.spinner_frame())
+    } else {
+        "Otto".to_string()
+    };
 
     let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::ALL).title("Otto"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(title_text)),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .select(app.selected_tab);
 
@@ -186,8 +248,8 @@ fn draw_mail_area(f: &mut ratatui::Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Min(5),      // list + detail
-                Constraint::Length(3),   // action bar
+                Constraint::Min(5),    // list + detail
+                Constraint::Length(3), // action bar
             ]
             .as_ref(),
         )
@@ -255,22 +317,20 @@ fn draw_action_bar(f: &mut ratatui::Frame, area: Rect) {
         Span::raw("[q] quit"),
     ]);
 
-    let paragraph = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).title("Actions"));
+    let paragraph =
+        Paragraph::new(line).block(Block::default().borders(Borders::ALL).title("Actions"));
 
     f.render_widget(paragraph, area);
 }
 
 fn draw_agent_panel(f: &mut ratatui::Frame, area: Rect) {
     let text = "Agent chat (future)\n\nThis panel will host conversations with coding agents (Codex, Claude, etc). For now it is a read-only placeholder.";
-    let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Agent"));
+    let paragraph =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Agent"));
     f.render_widget(paragraph, area);
 }
 
-pub fn build_mail_items(
-    messages: &[(MessageRecord, Option<BodyRecord>)],
-) -> Vec<MailItem> {
+pub fn build_mail_items(messages: &[(MessageRecord, Option<BodyRecord>)]) -> Vec<MailItem> {
     messages
         .iter()
         .map(|(msg, body)| {
@@ -284,11 +344,11 @@ pub fn build_mail_items(
                 .unwrap_or_else(|| "Unknown".to_string());
 
             let from = msg.from.clone().unwrap_or_else(|| "Unknown".to_string());
-            let subject = msg.subject.clone().unwrap_or_else(|| "(No Subject)".to_string());
-            let is_read = msg
-                .flags
-                .iter()
-                .any(|f| f.eq("Seen") || f.eq("\\Seen"));
+            let subject = msg
+                .subject
+                .clone()
+                .unwrap_or_else(|| "(No Subject)".to_string());
+            let is_read = msg.flags.iter().any(|f| f.eq("Seen") || f.eq("\\Seen"));
 
             let body_text = body
                 .as_ref()
@@ -298,8 +358,7 @@ pub fn build_mail_items(
 
             let preview = body_text
                 .lines()
-                .filter(|line| !line.trim().is_empty())
-                .next()
+                .find(|line| !line.trim().is_empty())
                 .unwrap_or("")
                 .to_string();
 

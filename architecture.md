@@ -2,7 +2,7 @@
 
 Otto syncs Gmail over IMAP into a local SQLite cache. Each run authorizes with OAuth2, opens one IMAP connection per folder, and uses CONDSTORE/MODSEQ to skip work when nothing changed; otherwise it fetches only new UIDs and flag updates, parses messages in parallel, and writes them in batches.
 
-On startup the CLI loads config and accounts from SQLite, optionally onboards a new account, runs the sync engine unless `--no-sync`, and prints a small inbox preview from the cache.
+On startup the CLI loads config and accounts from SQLite, optionally onboards a new account, and runs the sync engine unless `--no-sync`. When TUI mode is enabled, the interface launches immediately from the cached DB, starts a background sync (unless `--no-sync`), shows a top-bar spinner while syncing, and refreshes its message list from the updated cache once sync finishes.
 
 ## Components
 
@@ -14,7 +14,7 @@ On startup the CLI loads config and accounts from SQLite, optionally onboards a 
 - `src/sanitize/mod.rs`: MIME parsing, HTML→text, attachment detection, hashing.
 - `src/storage/db.rs` + `ops.rs`: SQLite schema/migrations and CRUD helpers.
 - `src/types.rs`: Shared structs (Account, MessageRecord, FolderState, etc.).
-- `src/tui.rs`: TUI overlay (top tabs + mail list/detail + agent panel placeholder) driven from the SQLite cache.
+- `src/tui.rs`: TUI overlay (top tabs + mail list/detail + agent panel placeholder) driven from the SQLite cache with a spinner indicator while background sync runs.
 
 ## Sync Flow (per folder)
 
