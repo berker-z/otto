@@ -12,7 +12,7 @@ On startup the CLI loads config and accounts from SQLite, optionally onboards a 
 - `src/imap/mod.rs`: IMAP client setup with XOAUTH2 over Rustls.
 - `src/sync/mod.rs`: Sync engine with connection pool, MODSEQ-based incremental sync, fetch/update helpers.
 - `src/sanitize/mod.rs`: MIME parsing, HTML→text, attachment detection, hashing; strips tracking params from URLs and unwraps common redirectors before rendering text.
-- `src/storage/db.rs` + `ops.rs`: SQLite schema/migrations and CRUD helpers.
+- `src/storage/db.rs` + `ops.rs`: SQLite schema/migrations and CRUD helpers; tracks folder sync status snapshots.
 - `src/types.rs`: Shared structs (Account, MessageRecord, FolderState, etc.).
 - `src/tui.rs`: TUI overlay (top tabs + mail list/detail + agent panel placeholder) driven from the SQLite cache with a spinner indicator while background sync runs.
 
@@ -35,6 +35,7 @@ On startup the CLI loads config and accounts from SQLite, optionally onboards a 
 - `folders`: per-folder state (`uidvalidity`, `highest_uid`, `highestmodseq`, counts, timestamps).
 - `messages`: metadata keyed by stable message id (`X-GM-MSGID`), per-folder uid, flags/labels, hashes.
 - `bodies`: raw RFC822, sanitized text, MIME summary, attachments JSON.
+- `folder_sync_state`: status (`in_progress`/`ok`/`failed`), start/finish timestamps, last seen modseq/uid.
 
 ## Current Limitations
 

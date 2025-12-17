@@ -320,6 +320,13 @@ impl SyncEngine {
             folder_state = Some(updated);
         }
 
+        // Mark sync start for observability and crash recovery heuristics.
+        let baseline_modseq = folder_state.as_ref().and_then(|s| s.highestmodseq);
+        let baseline_uid = folder_state.as_ref().and_then(|s| s.highest_uid);
+        self.db
+            .record_folder_sync_start(&account.id, folder_name, baseline_modseq, baseline_uid)
+            .await?;
+
         // Build search criteria - use CONDSTORE MODSEQ for change detection
         let cutoff_str = account.settings.cutoff_since.format("%d-%b-%Y").to_string();
 
@@ -342,9 +349,11 @@ impl SyncEngine {
                     "No changes detected (MODSEQ match) - skipping sync"
                 );
                 self.db
-                    .upsert_folder_state(
+                    .commit_folder_batch(
                         &account.id,
                         folder_name,
+                        &[],
+                        &[],
                         &FolderStateUpdate {
                             uidvalidity: Some(current_uidvalidity),
                             highest_uid: current_highest_uid,
@@ -355,6 +364,9 @@ impl SyncEngine {
                                 .as_ref()
                                 .and_then(|s| s.last_uid_scan_ts),
                         },
+                        "ok",
+                        current_highestmodseq,
+                        current_highest_uid,
                     )
                     .await?;
 
@@ -422,9 +434,11 @@ impl SyncEngine {
                 .unwrap_or(stored_highest_uid);
 
             self.db
-                .upsert_folder_state(
+                .commit_folder_batch(
                     &account.id,
                     folder_name,
+                    &[],
+                    &[],
                     &FolderStateUpdate {
                         uidvalidity: Some(current_uidvalidity),
                         highest_uid: Some(highest_uid),
@@ -433,6 +447,9 @@ impl SyncEngine {
                         last_sync_ts: Some(now),
                         last_uid_scan_ts: Some(now),
                     },
+                    "ok",
+                    current_highestmodseq,
+                    Some(highest_uid),
                 )
                 .await?;
 
@@ -500,6 +517,15 @@ impl SyncEngine {
                         last_sync_ts: Some(now),
                         last_uid_scan_ts,
                     },
+                )
+                .await?;
+            self.db
+                .record_folder_sync_end(
+                    &account.id,
+                    folder_name,
+                    "ok",
+                    current_highestmodseq,
+                    Some(highest_uid),
                 )
                 .await?;
             return Ok(FolderSyncReport {
@@ -571,9 +597,11 @@ impl SyncEngine {
             .or_else(|| changed_uids.iter().max().copied())
             .unwrap_or(stored_highest_uid);
         self.db
-            .upsert_folder_state(
+            .commit_folder_batch(
                 &account.id,
                 folder_name,
+                &[],
+                &[],
                 &FolderStateUpdate {
                     uidvalidity: Some(current_uidvalidity),
                     highest_uid: Some(highest_uid),
@@ -582,6 +610,9 @@ impl SyncEngine {
                     last_sync_ts: Some(now),
                     last_uid_scan_ts,
                 },
+                "ok",
+                current_highestmodseq,
+                Some(highest_uid),
             )
             .await?;
 

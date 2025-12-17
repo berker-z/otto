@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use dirs::home_dir;
 
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::env;
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -37,6 +37,15 @@ pub type MessageLocationUpdate = (
 pub struct Database {
     pool: SqlitePool,
     path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct FolderSyncState {
+    pub status: String,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub last_modseq: Option<u64>,
+    pub last_uid: Option<u32>,
 }
 
 impl Database {
@@ -72,6 +81,245 @@ impl Database {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub async fn get_folder_sync_state(
+        &self,
+        account_id: &str,
+        folder: &str,
+    ) -> Result<Option<FolderSyncState>> {
+        let row = sqlx::query(
+            r#"
+            SELECT status, started_at, finished_at, last_modseq, last_uid
+            FROM folder_sync_state
+            WHERE account_id = ?1 AND folder = ?2
+            "#,
+        )
+        .bind(account_id)
+        .bind(folder)
+        .fetch_optional(&self.pool)
+        .await
+        .context("loading folder sync state")?;
+
+        Ok(row.map(|r| FolderSyncState {
+            status: r.get::<String, _>(0),
+            started_at: r.get::<Option<i64>, _>(1),
+            finished_at: r.get::<Option<i64>, _>(2),
+            last_modseq: r.get::<Option<i64>, _>(3).map(|v| v as u64),
+            last_uid: r.get::<Option<i64>, _>(4).map(|v| v as u32),
+        }))
+    }
+
+    pub async fn record_folder_sync_start(
+        &self,
+        account_id: &str,
+        folder: &str,
+        baseline_modseq: Option<u64>,
+        baseline_uid: Option<u32>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO folder_sync_state (account_id, folder, status, started_at, finished_at, last_modseq, last_uid)
+            VALUES (?1, ?2, 'in_progress', ?3, NULL, ?4, ?5)
+            ON CONFLICT(account_id, folder) DO UPDATE SET
+                status = 'in_progress',
+                started_at = excluded.started_at,
+                finished_at = NULL,
+                last_modseq = excluded.last_modseq,
+                last_uid = excluded.last_uid;
+            "#,
+        )
+        .bind(account_id)
+        .bind(folder)
+        .bind(now_ts())
+        .bind(baseline_modseq.map(|v| v as i64))
+        .bind(baseline_uid.map(|v| v as i64))
+        .execute(&self.pool)
+        .await
+        .context("recording folder sync start")?;
+        Ok(())
+    }
+
+    pub async fn record_folder_sync_end(
+        &self,
+        account_id: &str,
+        folder: &str,
+        status: &str,
+        last_modseq: Option<u64>,
+        last_uid: Option<u32>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO folder_sync_state (account_id, folder, status, started_at, finished_at, last_modseq, last_uid)
+            VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)
+            ON CONFLICT(account_id, folder) DO UPDATE SET
+                status = excluded.status,
+                finished_at = excluded.finished_at,
+                last_modseq = excluded.last_modseq,
+                last_uid = excluded.last_uid;
+            "#,
+        )
+        .bind(account_id)
+        .bind(folder)
+        .bind(status)
+        .bind(now_ts())
+        .bind(last_modseq.map(|v| v as i64))
+        .bind(last_uid.map(|v| v as i64))
+        .execute(&self.pool)
+        .await
+        .context("recording folder sync end")?;
+        Ok(())
+    }
+
+    /// Atomically upsert messages/bodies, update folder state, and record sync end in a single transaction.
+    pub async fn commit_folder_batch(
+        &self,
+        account_id: &str,
+        folder: &str,
+        messages: &[MessageRecord],
+        bodies: &[BodyRecord],
+        folder_update: &FolderStateUpdate,
+        sync_status: &str,
+        last_modseq: Option<u64>,
+        last_uid: Option<u32>,
+    ) -> Result<()> {
+        if messages.len() != bodies.len() {
+            anyhow::bail!("messages and bodies length mismatch");
+        }
+
+        let mut tx: Transaction<'_, Sqlite> = self.pool.begin().await.context("begin tx")?;
+
+        for (message, body) in messages.iter().zip(bodies.iter()) {
+            sqlx::query(
+                r#"
+                INSERT INTO messages (
+                    id, account_id, folder, uid, thread_id, internal_date,
+                    subject, from_addr, to_addrs, cc_addrs, bcc_addrs,
+                    flags, labels, has_attachments, size_bytes, raw_hash,
+                    created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                ON CONFLICT(id) DO UPDATE SET
+                    account_id = excluded.account_id,
+                    folder = excluded.folder,
+                    uid = excluded.uid,
+                    thread_id = excluded.thread_id,
+                    internal_date = excluded.internal_date,
+                    subject = excluded.subject,
+                    from_addr = excluded.from_addr,
+                    to_addrs = excluded.to_addrs,
+                    cc_addrs = excluded.cc_addrs,
+                    bcc_addrs = excluded.bcc_addrs,
+                    flags = excluded.flags,
+                    labels = excluded.labels,
+                    has_attachments = excluded.has_attachments,
+                    size_bytes = excluded.size_bytes,
+                    raw_hash = excluded.raw_hash,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at;
+                "#,
+            )
+            .bind(&message.id)
+            .bind(&message.account_id)
+            .bind(&message.folder)
+            .bind(message.uid.map(|v| v as i64))
+            .bind(&message.thread_id)
+            .bind(message.internal_date)
+            .bind(&message.subject)
+            .bind(&message.from)
+            .bind(&message.to)
+            .bind(&message.cc)
+            .bind(&message.bcc)
+            .bind(serde_json::to_string(&message.flags).unwrap_or_else(|_| "[]".into()))
+            .bind(serde_json::to_string(&message.labels).unwrap_or_else(|_| "[]".into()))
+            .bind(if message.has_attachments { 1 } else { 0 })
+            .bind(message.size_bytes.map(|v| v as i64))
+            .bind(&message.raw_hash)
+            .bind(message.created_at)
+            .bind(message.updated_at)
+            .execute(&mut *tx)
+            .await
+            .context("upserting message in tx")?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO bodies (message_id, raw_rfc822, sanitized_text, mime_summary, attachments_json, sanitized_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    raw_rfc822 = excluded.raw_rfc822,
+                    sanitized_text = excluded.sanitized_text,
+                    mime_summary = excluded.mime_summary,
+                    attachments_json = excluded.attachments_json,
+                    sanitized_at = excluded.sanitized_at;
+                "#,
+            )
+            .bind(&body.message_id)
+            .bind(&body.raw_rfc822)
+            .bind(&body.sanitized_text)
+            .bind(&body.mime_summary)
+            .bind(&body.attachments_json)
+            .bind(body.sanitized_at)
+            .execute(&mut *tx)
+            .await
+            .context("upserting body in tx")?;
+        }
+
+        // Upsert folder state
+        sqlx::query(
+            r#"
+            INSERT INTO folders (
+                account_id, name, uidvalidity, highest_uid, highestmodseq,
+                exists_count, last_sync_ts, last_uid_scan_ts, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(account_id, name) DO UPDATE SET
+                uidvalidity = excluded.uidvalidity,
+                highest_uid = excluded.highest_uid,
+                highestmodseq = excluded.highestmodseq,
+                exists_count = excluded.exists_count,
+                last_sync_ts = excluded.last_sync_ts,
+                last_uid_scan_ts = excluded.last_uid_scan_ts,
+                updated_at = excluded.updated_at;
+            "#,
+        )
+        .bind(account_id)
+        .bind(folder)
+        .bind(folder_update.uidvalidity.map(|v| v as i64))
+        .bind(folder_update.highest_uid.map(|v| v as i64))
+        .bind(folder_update.highestmodseq.map(|v| v as i64))
+        .bind(folder_update.exists_count.map(|v| v as i64))
+        .bind(folder_update.last_sync_ts)
+        .bind(folder_update.last_uid_scan_ts)
+        .bind(now_ts())
+        .bind(now_ts())
+        .execute(&mut *tx)
+        .await
+        .context("upserting folder state in tx")?;
+
+        // Record sync end status
+        sqlx::query(
+            r#"
+            INSERT INTO folder_sync_state (account_id, folder, status, started_at, finished_at, last_modseq, last_uid)
+            VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)
+            ON CONFLICT(account_id, folder) DO UPDATE SET
+                status = excluded.status,
+                finished_at = excluded.finished_at,
+                last_modseq = excluded.last_modseq,
+                last_uid = excluded.last_uid;
+            "#,
+        )
+        .bind(account_id)
+        .bind(folder)
+        .bind(sync_status)
+        .bind(now_ts())
+        .bind(last_modseq.map(|v| v as i64))
+        .bind(last_uid.map(|v| v as i64))
+        .execute(&mut *tx)
+        .await
+        .context("recording folder sync end in tx")?;
+
+        tx.commit().await.context("commit folder batch tx")?;
+        Ok(())
     }
 
     async fn migrate(&self) -> Result<()> {
@@ -145,6 +393,18 @@ impl Database {
                 attachments_json TEXT,
                 sanitized_at INTEGER,
                 FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS folder_sync_state (
+                account_id TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                last_modseq INTEGER,
+                last_uid INTEGER,
+                PRIMARY KEY (account_id, folder),
+                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
             "#,
         )
