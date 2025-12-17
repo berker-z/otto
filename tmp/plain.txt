@@ -1,8 +1,0 @@
-Subject: Hello there
-
-Hi Berker,
-This is a plain text note.
-
-- No HTML here
-- Links like https://example.com/hello?ref=foo should maybe keep path.
-- Redirector: https://outlook.live.com/owa/?path=/redir&url=https%3A%2F%2Fexample.com%2Ftarget%3Ftoken%3Dabc123&client=foo
