@@ -22,6 +22,7 @@
 
 ## Done (Recent)
 
+- Per-folder sync commits now route all message/body inserts plus location + flag updates and folder_sync_state into one `commit_folder_batch` transaction (network/parse stays outside).
 - UIDVALIDITY change now clears folder cache and rebuilds baseline.
 - Expunge fallback now runs a periodic UID scan and purges missing UIDs after folder syncs complete.
 - MIME summaries and attachment metadata are now populated; label refresh is included in flag updates.

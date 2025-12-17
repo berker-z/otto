@@ -23,8 +23,7 @@ fn main() -> io::Result<()> {
 
     let start = Instant::now();
     let text = if looks_like_html(&cleaned) {
-        html2text::from_read(cleaned.as_bytes(), 80)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        html2text::from_read(cleaned.as_bytes(), 80).map_err(io::Error::other)?
     } else {
         cleaned
     };
@@ -144,24 +143,25 @@ fn try_unwrap_redirect(raw: &str) -> Option<String> {
     let pick_param = |keys: &[&str]| -> Option<String> {
         for k in keys {
             if let Some((_, v)) = query_pairs.iter().find(|(key, _)| key == k) {
-                return Url::parse(v).ok().map(|u| clean_url(&u.to_string()));
+                return Url::parse(v).ok().map(|u| clean_url(u.as_ref()));
             }
         }
         None
     };
 
     // Outlook/OWA redirect pattern.
-    if host.contains("outlook.live.com") && path.contains("redir") {
-        if let Some(dest) = pick_param(&["url", "destination"]) {
-            return Some(dest);
-        }
+    if host.contains("outlook.live.com")
+        && path.contains("redir")
+        && let Some(dest) = pick_param(&["url", "destination"])
+    {
+        return Some(dest);
     }
 
     // LinkedIn shorteners/safety redirects.
-    if host.ends_with("lnkd.in") || host.contains("linkedin.com") && path.contains("redir") {
-        if let Some(dest) = pick_param(&["url", "dest", "target"]) {
-            return Some(dest);
-        }
+    if (host.ends_with("lnkd.in") || host.contains("linkedin.com") && path.contains("redir"))
+        && let Some(dest) = pick_param(&["url", "dest", "target"])
+    {
+        return Some(dest);
     }
 
     // Generic redirect params.

@@ -204,7 +204,8 @@ fn extract_text(parsed: &ParsedMail, raw_bytes: &[u8]) -> String {
         return text;
     }
     // As last resort, render the whole raw message body.
-    render_text_part(&String::from_utf8_lossy(raw_bytes).to_string())
+    let raw_lossy = String::from_utf8_lossy(raw_bytes);
+    render_text_part(raw_lossy.as_ref())
 }
 
 fn html_to_text(html: &[u8]) -> String {
@@ -221,7 +222,8 @@ fn render_text_part(body: &str) -> String {
 }
 
 fn render_html_part(html: &[u8]) -> String {
-    let cleaned = clean_urls_in_text(&String::from_utf8_lossy(html));
+    let lossless = String::from_utf8_lossy(html);
+    let cleaned = clean_urls_in_text(lossless.as_ref());
     html_to_text(cleaned.as_bytes())
 }
 
@@ -260,23 +262,21 @@ fn extract_preferred_text(part: &ParsedMail) -> Option<String> {
 
     // Handle multipart/alternative with preference: text/plain then text/html then others.
     if mimetype.starts_with("multipart/alternative") {
-        if let Some(text_part) = part
+        if let Some(text) = part
             .subparts
             .iter()
             .find(|p| p.ctype.mimetype.eq_ignore_ascii_case("text/plain"))
+            .and_then(|p| extract_preferred_text(p))
         {
-            if let Some(text) = extract_preferred_text(text_part) {
-                return Some(text);
-            }
+            return Some(text);
         }
-        if let Some(html_part) = part
+        if let Some(text) = part
             .subparts
             .iter()
             .find(|p| p.ctype.mimetype.eq_ignore_ascii_case("text/html"))
+            .and_then(|p| extract_preferred_text(p))
         {
-            if let Some(text) = extract_preferred_text(html_part) {
-                return Some(text);
-            }
+            return Some(text);
         }
     }
 
@@ -397,24 +397,25 @@ fn try_unwrap_redirect(raw: &str) -> Option<String> {
     let pick_param = |keys: &[&str]| -> Option<String> {
         for k in keys {
             if let Some((_, v)) = query_pairs.iter().find(|(key, _)| key == k) {
-                return Url::parse(v).ok().map(|u| clean_url(&u.to_string()));
+                return Url::parse(v).ok().map(|u| clean_url(u.as_ref()));
             }
         }
         None
     };
 
     // Outlook/OWA redirect pattern.
-    if host.contains("outlook.live.com") && path.contains("redir") {
-        if let Some(dest) = pick_param(&["url", "destination"]) {
-            return Some(dest);
-        }
+    if host.contains("outlook.live.com")
+        && path.contains("redir")
+        && let Some(dest) = pick_param(&["url", "destination"])
+    {
+        return Some(dest);
     }
 
     // LinkedIn shorteners/safety redirects.
-    if host.ends_with("lnkd.in") || (host.contains("linkedin.com") && path.contains("redir")) {
-        if let Some(dest) = pick_param(&["url", "dest", "target"]) {
-            return Some(dest);
-        }
+    if (host.ends_with("lnkd.in") || (host.contains("linkedin.com") && path.contains("redir")))
+        && let Some(dest) = pick_param(&["url", "dest", "target"])
+    {
+        return Some(dest);
     }
 
     // Generic redirect params.

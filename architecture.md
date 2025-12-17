@@ -25,8 +25,8 @@ On startup the CLI loads config and accounts from SQLite, optionally onboards a 
    - Fetch bodies for unseen UIDs.
    - Fetch flags + labels for existing UIDs and update DB.
 5. If `EXISTS` decreased (or scan is stale), run a periodic `UID SEARCH SINCE <cutoff>` to detect missing UIDs.
-6. Update folder state (`highest_uid`, `highestmodseq`, counts, timestamps).
-7. After all folders finish, purge missing UIDs from the DB (prevents “move” races).
+6. Update folder state (`highest_uid`, `highestmodseq`, counts, timestamps) via a single `commit_folder_batch` transaction that also applies new message/body inserts plus per-folder flag/label and location updates, and records `folder_sync_state` end status (all fetch/parse happens before the transaction).
+7. After all folders finish, purge missing UIDs from the DB (outside the per-folder transaction to avoid deleting moves mid-sync).
 8. Local dedupe pass removes pre-X-GM-MSGID duplicates by `raw_hash`.
 
 ## Data Model (SQLite)

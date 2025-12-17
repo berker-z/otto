@@ -171,13 +171,16 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically upsert messages/bodies, update folder state, and record sync end in a single transaction.
+    #[allow(clippy::too_many_arguments)] // transaction aggregator for all per-folder writes
+    /// Atomically apply per-folder writes (new messages/bodies, location/flag updates), update folder state, and record sync end in one transaction.
     pub async fn commit_folder_batch(
         &self,
         account_id: &str,
         folder: &str,
         messages: &[MessageRecord],
         bodies: &[BodyRecord],
+        location_updates: &[MessageLocationUpdate],
+        flag_updates: &[(u32, Vec<String>, Vec<String>)],
         folder_update: &FolderStateUpdate,
         sync_status: &str,
         last_modseq: Option<u64>,
@@ -188,6 +191,7 @@ impl Database {
         }
 
         let mut tx: Transaction<'_, Sqlite> = self.pool.begin().await.context("begin tx")?;
+        let now = now_ts();
 
         for (message, body) in messages.iter().zip(bodies.iter()) {
             sqlx::query(
@@ -264,6 +268,61 @@ impl Database {
             .context("upserting body in tx")?;
         }
 
+        if !location_updates.is_empty() {
+            for (message_id, folder, uid, flags, labels, thread_id, internal_date, size_bytes) in
+                location_updates
+            {
+                sqlx::query(
+                    r#"
+                    UPDATE messages
+                    SET folder = ?1,
+                        uid = ?2,
+                        flags = ?3,
+                        labels = ?4,
+                        thread_id = ?5,
+                        internal_date = ?6,
+                        size_bytes = ?7,
+                        updated_at = ?8
+                    WHERE account_id = ?9 AND id = ?10;
+                    "#,
+                )
+                .bind(folder)
+                .bind(*uid as i64)
+                .bind(serde_json::to_string(flags).unwrap_or_else(|_| "[]".into()))
+                .bind(serde_json::to_string(labels).unwrap_or_else(|_| "[]".into()))
+                .bind(thread_id)
+                .bind(internal_date)
+                .bind(size_bytes.map(|v| v as i64))
+                .bind(now)
+                .bind(account_id)
+                .bind(message_id)
+                .execute(&mut *tx)
+                .await
+                .context("updating message location in tx")?;
+            }
+        }
+
+        if !flag_updates.is_empty() {
+            for (uid, flags, labels) in flag_updates {
+                sqlx::query(
+                    r#"
+                    UPDATE messages
+                    SET flags = ?1, labels = ?2, updated_at = ?3
+                    WHERE account_id = ?4 AND folder = ?5 AND uid = ?6;
+                    "#,
+                )
+                .bind(serde_json::to_string(flags).unwrap_or_else(|_| "[]".into()))
+                .bind(serde_json::to_string(labels).unwrap_or_else(|_| "[]".into()))
+                .bind(now)
+                .bind(account_id)
+                .bind(folder)
+                .bind(*uid as i64)
+                .execute(&mut *tx)
+                .await
+                .context("updating message flags/labels in tx")?;
+            }
+        }
+
         // Upsert folder state
         sqlx::query(
             r#"
@@ -290,8 +349,8 @@ impl Database {
         .bind(folder_update.exists_count.map(|v| v as i64))
         .bind(folder_update.last_sync_ts)
         .bind(folder_update.last_uid_scan_ts)
-        .bind(now_ts())
-        .bind(now_ts())
+        .bind(now)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .context("upserting folder state in tx")?;
@@ -311,7 +370,7 @@ impl Database {
         .bind(account_id)
         .bind(folder)
         .bind(sync_status)
-        .bind(now_ts())
+        .bind(now)
         .bind(last_modseq.map(|v| v as i64))
         .bind(last_uid.map(|v| v as i64))
         .execute(&mut *tx)

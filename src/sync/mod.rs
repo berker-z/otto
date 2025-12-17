@@ -329,6 +329,10 @@ impl SyncEngine {
 
         // Build search criteria - use CONDSTORE MODSEQ for change detection
         let cutoff_str = account.settings.cutoff_since.format("%d-%b-%Y").to_string();
+        let mut pending_messages: Vec<MessageRecord> = Vec::new();
+        let mut pending_bodies: Vec<BodyRecord> = Vec::new();
+        let mut pending_location_updates: Vec<MessageLocationUpdate> = Vec::new();
+        let mut pending_flag_updates: Vec<(u32, Vec<String>, Vec<String>)> = Vec::new();
 
         // MODSEQ optimization: Early exit if nothing changed (unless force=true)
         if !force
@@ -352,6 +356,8 @@ impl SyncEngine {
                     .commit_folder_batch(
                         &account.id,
                         folder_name,
+                        &[],
+                        &[],
                         &[],
                         &[],
                         &FolderStateUpdate {
@@ -423,8 +429,11 @@ impl SyncEngine {
                 .collect();
 
             if !new_uids.is_empty() {
-                self.fetch_and_store_new_messages(session, account, folder_name, &new_uids)
+                let (messages, bodies) = self
+                    .fetch_and_collect_new_messages(session, account, folder_name, &new_uids)
                     .await?;
+                pending_messages.extend(messages);
+                pending_bodies.extend(bodies);
             }
 
             let expunged_uids: Vec<u32> = local_uids.difference(&remote_uids).copied().collect();
@@ -437,8 +446,10 @@ impl SyncEngine {
                 .commit_folder_batch(
                     &account.id,
                     folder_name,
-                    &[],
-                    &[],
+                    &pending_messages,
+                    &pending_bodies,
+                    &pending_location_updates,
+                    &pending_flag_updates,
                     &FolderStateUpdate {
                         uidvalidity: Some(current_uidvalidity),
                         highest_uid: Some(highest_uid),
@@ -452,6 +463,22 @@ impl SyncEngine {
                     Some(highest_uid),
                 )
                 .await?;
+
+            if !pending_messages.is_empty()
+                && account.provider == crate::types::Provider::GmailImap
+                && let Ok(n) = self
+                    .db
+                    .dedupe_fallback_messages_by_raw_hash(&account.id, 500)
+                    .await
+                && n > 0
+            {
+                debug!(
+                    account = %account.id,
+                    folder = %folder_name,
+                    deleted = n,
+                    "Deduped legacy messages after full-scan commit"
+                );
+            }
 
             return Ok(FolderSyncReport {
                 folder: folder_name.to_string(),
@@ -506,9 +533,13 @@ impl SyncEngine {
 
             let highest_uid = current_highest_uid.unwrap_or(stored_highest_uid);
             self.db
-                .upsert_folder_state(
+                .commit_folder_batch(
                     &account.id,
                     folder_name,
+                    &pending_messages,
+                    &pending_bodies,
+                    &pending_location_updates,
+                    &pending_flag_updates,
                     &FolderStateUpdate {
                         uidvalidity: Some(current_uidvalidity),
                         highest_uid: Some(highest_uid),
@@ -517,12 +548,6 @@ impl SyncEngine {
                         last_sync_ts: Some(now),
                         last_uid_scan_ts,
                     },
-                )
-                .await?;
-            self.db
-                .record_folder_sync_end(
-                    &account.id,
-                    folder_name,
                     "ok",
                     current_highestmodseq,
                     Some(highest_uid),
@@ -559,13 +584,19 @@ impl SyncEngine {
         );
 
         if !new_uids.is_empty() {
-            self.fetch_and_handle_new_uids(session, account, folder_name, &new_uids)
+            let (messages, bodies, location_updates) = self
+                .fetch_and_handle_new_uids(session, account, folder_name, &new_uids)
                 .await?;
+            pending_messages.extend(messages);
+            pending_bodies.extend(bodies);
+            pending_location_updates.extend(location_updates);
         }
 
         if !existing_uids.is_empty() {
-            self.fetch_and_update_flags(session, account, folder_name, &existing_uids)
+            let mut updates = self
+                .fetch_and_update_flags(session, account, folder_name, &existing_uids)
                 .await?;
+            pending_flag_updates.append(&mut updates);
         }
 
         let mut expunged_uids = Vec::new();
@@ -600,8 +631,10 @@ impl SyncEngine {
             .commit_folder_batch(
                 &account.id,
                 folder_name,
-                &[],
-                &[],
+                &pending_messages,
+                &pending_bodies,
+                &pending_location_updates,
+                &pending_flag_updates,
                 &FolderStateUpdate {
                     uidvalidity: Some(current_uidvalidity),
                     highest_uid: Some(highest_uid),
@@ -615,6 +648,22 @@ impl SyncEngine {
                 Some(highest_uid),
             )
             .await?;
+
+        if !pending_messages.is_empty()
+            && account.provider == crate::types::Provider::GmailImap
+            && let Ok(n) = self
+                .db
+                .dedupe_fallback_messages_by_raw_hash(&account.id, 500)
+                .await
+            && n > 0
+        {
+            debug!(
+                account = %account.id,
+                folder = %folder_name,
+                deleted = n,
+                "Deduped legacy messages after incremental commit"
+            );
+        }
 
         Ok(FolderSyncReport {
             folder: folder_name.to_string(),
@@ -648,15 +697,18 @@ impl SyncEngine {
         Ok(local_uids.difference(&remote_uids).copied().collect())
     }
 
-    async fn fetch_and_store_new_messages(
+    async fn fetch_and_collect_new_messages(
         &self,
         session: &mut ImapSession,
         account: &Account,
         folder_name: &str,
         uids: &[u32],
-    ) -> Result<()> {
+    ) -> Result<(Vec<MessageRecord>, Vec<BodyRecord>)> {
         // Limit batch size to avoid memory issues
         const BATCH_SIZE: usize = 50;
+
+        let mut all_messages = Vec::new();
+        let mut all_bodies = Vec::new();
 
         for chunk in uids.chunks(BATCH_SIZE) {
             let batch_start = Instant::now();
@@ -846,46 +898,24 @@ impl SyncEngine {
                 }
             }
 
-            // Batch write all messages and bodies in a single transaction
             if !messages_batch.is_empty() {
-                let write_start = Instant::now();
-
-                self.db
-                    .batch_upsert_messages_with_bodies(&messages_batch, &bodies_batch)
-                    .await?;
-
-                // Clean up legacy duplicates (old fallback ids) now that we have stable ids + raw_hash.
-                // This is intentionally conservative: it only removes legacy ids (contain ':') when
-                // a stable numeric id row exists for the same raw bytes.
-                if account.provider == crate::types::Provider::GmailImap
-                    && let Ok(n) = self
-                        .db
-                        .dedupe_fallback_messages_by_raw_hash(&account.id, 500)
-                        .await
-                    && n > 0
-                {
-                    debug!(
-                        account = %account.id,
-                        folder = %folder_name,
-                        deleted = n,
-                        "Deduped legacy messages after batch insert"
-                    );
-                }
+                let batch_count = messages_batch.len();
+                all_messages.extend(messages_batch);
+                all_bodies.extend(bodies_batch);
 
                 info!(
                     account = %account.id,
                     folder = %folder_name,
-                    count = messages_batch.len(),
+                    count = batch_count,
                     fetch_ms = ?fetch_start.elapsed().as_millis(),
                     parse_ms = ?parse_start.elapsed().as_millis(),
-                    write_ms = ?write_start.elapsed().as_millis(),
                     total_ms = ?batch_start.elapsed().as_millis(),
-                    "Batch processed (parallel parse + transaction write)"
+                    "Batch processed (parallel parse, pending commit)"
                 );
             }
         }
 
-        Ok(())
+        Ok((all_messages, all_bodies))
     }
 
     async fn fetch_and_handle_new_uids(
@@ -894,7 +924,11 @@ impl SyncEngine {
         account: &Account,
         folder_name: &str,
         uids: &[u32],
-    ) -> Result<()> {
+    ) -> Result<(
+        Vec<MessageRecord>,
+        Vec<BodyRecord>,
+        Vec<MessageLocationUpdate>,
+    )> {
         const BATCH_SIZE: usize = 250;
 
         let mut need_body: Vec<u32> = Vec::new();
@@ -974,24 +1008,18 @@ impl SyncEngine {
             }
         }
 
-        if !location_updates.is_empty() {
-            self.db
-                .batch_update_message_location_by_id(&account.id, &location_updates)
-                .await?;
-            info!(
-                account = %account.id,
-                folder = %folder_name,
-                count = location_updates.len(),
-                "Moved/existing messages updated without refetching bodies"
-            );
-        }
+        let mut messages = Vec::new();
+        let mut bodies = Vec::new();
 
         if !need_body.is_empty() {
-            self.fetch_and_store_new_messages(session, account, folder_name, &need_body)
+            let (fetched_messages, fetched_bodies) = self
+                .fetch_and_collect_new_messages(session, account, folder_name, &need_body)
                 .await?;
+            messages.extend(fetched_messages);
+            bodies.extend(fetched_bodies);
         }
 
-        Ok(())
+        Ok((messages, bodies, location_updates))
     }
 
     #[allow(dead_code)]
@@ -1082,7 +1110,7 @@ impl SyncEngine {
         account: &Account,
         folder_name: &str,
         uids: &[u32],
-    ) -> Result<()> {
+    ) -> Result<Vec<(u32, Vec<String>, Vec<String>)>> {
         const BATCH_SIZE: usize = 250;
 
         let mut updates: Vec<(u32, Vec<String>, Vec<String>)> = Vec::new();
@@ -1114,18 +1142,15 @@ impl SyncEngine {
         }
 
         if !updates.is_empty() {
-            self.db
-                .batch_update_message_flags_by_uid(&account.id, folder_name, &updates)
-                .await?;
             debug!(
                 account = %account.id,
                 folder = %folder_name,
                 count = updates.len(),
-                "Updated flags/labels for changed messages"
+                "Prepared flag/label updates for changed messages"
             );
         }
 
-        Ok(())
+        Ok(updates)
     }
 }
 
