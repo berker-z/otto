@@ -10,6 +10,7 @@
 
 - Add per-folder CLI options (sync subset, rebuild baseline for one folder).
 - Harden OAuth/token storage UX during onboarding (better errors, validation).
+- Evolve TUI from read-only viewer to interactive client (read/unread toggles, delete/archive, refresh).
 
 ## Later
 

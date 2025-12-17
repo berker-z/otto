@@ -34,6 +34,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 rustls-native-certs = "0.6"
 quoted_printable = "0.5"
 deadpool = "0.12"
+ratatui = { version = "0.26", default-features = false, features = ["crossterm"] }
+crossterm = "0.27"
 
 [dev-dependencies]
 imap-proto = "0.16.6"

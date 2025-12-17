@@ -9,3 +9,4 @@ pub mod sanitize;
 pub mod storage;
 pub mod sync;
 pub mod types;
+pub mod tui;

@@ -3,6 +3,7 @@ use crate::config::AppDefaults;
 use crate::onboarding;
 use crate::storage::Database;
 use crate::sync::SyncEngine;
+use crate::tui;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -32,6 +33,21 @@ pub async fn run(cli: Cli) -> Result<()> {
         engine.sync_all(&accounts, cli.force).await?;
     } else {
         info!("Skipping sync; using cached data only");
+    }
+
+    if cli.tui {
+        // For now, show latest messages for the first account as a TUI overlay.
+        if let Some(account) = accounts.first() {
+            let messages = db.load_messages(&account.id, 50).await?;
+            let mail_items = tui::build_mail_items(&messages);
+            let state = tui::TuiState { mail_items };
+
+            // Run blocking TUI inside the async runtime.
+            tokio::task::block_in_place(|| tui::run(state))?;
+        } else {
+            warn!("No accounts available for TUI; falling back to simple list.");
+        }
+        return Ok(());
     }
 
     // Display latest 10 emails

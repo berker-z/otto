@@ -19,4 +19,8 @@ pub struct Cli {
     /// Force safe mode (disable mutations) even if account-level safe_mode is false.
     #[arg(long)]
     pub safe_mode: bool,
+
+    /// Launch the TUI overlay instead of printing a simple list.
+    #[arg(long)]
+    pub tui: bool,
 }
