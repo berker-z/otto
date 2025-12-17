@@ -1,0 +1,11 @@
+pub mod app;
+pub mod cli;
+pub mod config;
+pub mod errors;
+pub mod imap;
+pub mod oauth;
+pub mod onboarding;
+pub mod sanitize;
+pub mod storage;
+pub mod sync;
+pub mod types;
