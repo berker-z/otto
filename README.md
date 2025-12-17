@@ -1,14 +1,16 @@
 # Otto
 
-A high-performance IMAP email client that syncs Gmail to a local SQLite cache with intelligent change detection.
+Otto is a Rust IMAP syncer for Gmail. It authorizes with OAuth2, opens one IMAP connection per folder, and keeps a local SQLite cache of messages and sanitized bodies. Each run skips work when MODSEQ matches; otherwise it fetches only new UIDs and updates flags, parsing messages in parallel and writing in batches.
+
+On startup the CLI loads accounts from SQLite (or onboards one), runs the sync unless `--no-sync`, and prints a small inbox preview from the cache. Messages are keyed by stable Gmail ids (`X-GM-MSGID`) so moves avoid duplicates; expunges still need QRESYNC/VANISHED to be tracked.
 
 ## Features
 
-- **Incremental Sync**: Uses IMAP CONDSTORE/MODSEQ to detect changes efficiently (like Gmail History API)
-- **Parallel Processing**: Syncs folders concurrently and parses messages in parallel
-- **Smart Caching**: Stores sanitized plaintext bodies locally for instant access
-- **OAuth2**: Secure Google authentication with automatic token refresh
-- **Batch Operations**: Transaction-based database writes for optimal performance
+- Incremental IMAP sync via CONDSTORE/MODSEQ
+- Parallel folder syncing and MIME parsing
+- Local SQLite cache with sanitized plaintext bodies
+- OAuth2 with token refresh
+- Batched database writes
 
 ## Quick Start
 
@@ -68,21 +70,11 @@ RUST_LOG=debug cargo run --release
 
 ## How It Works
 
-Otto uses IMAP with CONDSTORE extension to track changes:
-
-1. **SELECT folder** - Gets current MODSEQ (modification sequence number)
-2. **Compare MODSEQ** - If unchanged since last sync → skip entirely ✅
-3. **Incremental fetch** - If changed → only fetch new/modified messages
-4. **Parallel parse** - Uses all CPU cores to parse MIME and extract plaintext
-5. **Batch write** - Single database transaction for all messages
-
-Otto avoids full UID scans after initial seeding. On Gmail, moves between synced folders are
-tracked via `X-GM-MSGID` (stable id) + per-folder MODSEQ changes, so a move updates the existing
-row instead of creating duplicates. True expunges that don’t reappear in another synced folder
-require QRESYNC/VANISHED (not implemented yet).
-
-If you previously synced before `X-GM-MSGID` was stored, Otto performs a local-only dedupe pass
-based on `raw_hash` to remove legacy `account:folder:uid` duplicates.
+- `SELECT (CONDSTORE)` to read `HIGHESTMODSEQ` and `UIDVALIDITY`.
+- If MODSEQ unchanged and `--force` not set → skip.
+- No baseline: `UID SEARCH SINCE <cutoff>` then fetch new UIDs.
+- With baseline: `UID SEARCH SINCE <cutoff> MODSEQ <stored+1>`; fetch bodies for new UIDs and flags for existing.
+- Update folder state and store sanitized content in SQLite.
 
 ### Performance
 
